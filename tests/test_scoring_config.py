@@ -217,3 +217,15 @@ def test_operator_can_configure_twenty_percent_delta_cap(manifest):
     assert RiskLimits().residual_delta == 0.1
     with pytest.raises(ValidationError):
         RiskLimits(residual_delta=0.21)
+
+
+def test_fast_paper_policy_retains_risk_uncertainty_and_frequency_floor():
+    from pydantic import ValidationError
+
+    from hedge.config import TradingPolicy
+
+    policy = TradingPolicy(stock_seconds=15, option_seconds=120, score_threshold=25)
+    assert policy.uncertainty_multiplier == 1.645
+    assert policy.option_cutoff_minutes == 15 and policy.stock_cutoff_minutes == 2
+    with pytest.raises(ValidationError):
+        TradingPolicy(stock_seconds=14)

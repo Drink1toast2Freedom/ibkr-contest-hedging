@@ -182,3 +182,31 @@ def test_optimizer_never_selects_frozen_or_stale_new_hedges(manifest, snapshot, 
     assert target.status == "NO_CANDIDATES"
     assert target.quantities == snapshot.quantities()
     assert target.estimated_cost == 0
+
+
+def test_nav_deficit_is_in_objective_and_can_select_target_closing_trade(manifest, snapshot, quotes):
+    # Controlled positive-return assumptions prove mechanics, not a real forecast.
+    m = manifest.model_copy(update={"allowlist": (10,)})
+    ids = (10, 101, 102)
+    scenarios = ScenarioSet(
+        ids,
+        np.array([[10.0, 0.0, 0.0], [20.0, 0.0, 0.0]]),
+        np.array([0.5, 0.5]),
+        np.array([[-39.0, 0.0, 0.0], [39.0, 0.0, 0.0]]),
+        None,
+        0.1,
+        "controlled fixture",
+        "deficit-fixture",
+    )
+    target = HedgeOptimizer(m).solve(
+        snapshot, quotes, scenarios, m.initial_nav, nav_estimate=float(m.initial_nav) - 4000
+    )
+    assert target.status == "OPTIMAL"
+    assert target.current_score == pytest.approx(4000)
+    assert target.expected_score < target.current_score - 1000
+    assert target.quantities[10] > 0
+    assert target.quantities[101] == target.quantities[102] == 25
+    at_target = HedgeOptimizer(m).solve(
+        snapshot, quotes, scenarios, m.initial_nav, nav_estimate=float(m.initial_nav)
+    )
+    assert at_target.quantities.get(10, 0) == 0

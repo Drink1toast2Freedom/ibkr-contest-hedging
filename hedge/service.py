@@ -330,11 +330,7 @@ class TradingService:
                             self.health = "Working-order risk blocked: " + "; ".join(projected_check.reasons)
                             self.alert("error", self.health)
                     if self.mode in ("SHADOW", "PAPER"):
-                        if self.pending_target is None and (
-                            self.force_optimize
-                            or time.monotonic() - self.last_optimization["STK"]
-                            >= self.manifest.policy.stock_seconds
-                        ):
+                        if self.optimization_due():
                             await self.optimize()
                     elif self.mode == "SETUP":
                         await self._setup_slice()
@@ -411,6 +407,15 @@ class TradingService:
                 next_connection = time.monotonic() + 15
                 await asyncio.sleep(5)
 
+    def optimization_due(self):
+        """Continuous evaluation remains independent of whether past trades filled."""
+        elapsed = time.monotonic()
+        return self.pending_target is None and (
+            self.force_optimize
+            or elapsed - self.last_optimization["STK"] >= self.manifest.policy.stock_seconds
+            or elapsed - self.last_optimization["OPT"] >= self.manifest.policy.option_seconds
+        )
+
     async def optimize(self):
         if self.manifest.scoring_rule == "pending_interest_adjustment":
             self.health = "Scoring revision pending; interest-offset optimization disabled"
@@ -477,6 +482,20 @@ class TradingService:
                         newest, self.broker.quotes(), scenarios, newest.quantities()
                     ).passed
                 ),
+                "nav_gap": estimate - float(previous),
+                "closing_target": float(previous),
+                "optimization_scope": "FULL" if full else "STOCK",
+                "hold_distance": target.current_score,
+                "proposed_distance": target.expected_score,
+                "blocking_reasons": (
+                    list(gate.reasons)
+                    + ([f"Solver: {target.status}"] if target.status != "OPTIMAL" else [])
+                    + (
+                        [f"Modeled improvement ${improvement:.2f} does not exceed threshold ${threshold:.2f}"]
+                        if improvement <= threshold and gate.passed
+                        else []
+                    )
+                ),
                 "source": scenarios.source,
                 "profile": self.profile,
                 "at": now.isoformat(),
@@ -493,7 +512,7 @@ class TradingService:
             self.health = (
                 "Monitoring: proposal eligible"
                 if record["trade_eligible"]
-                else "Monitoring: no trade justified or risk check blocked"
+                else "Monitoring: " + "; ".join(record["blocking_reasons"] or ["No qualifying trade"])
             )
 
     async def _execute_pending(self):

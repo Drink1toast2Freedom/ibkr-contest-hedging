@@ -32,7 +32,7 @@ class RiskLimits(Frozen):
 
 class TradingPolicy(Frozen):
     risk_seconds: int = Field(default=5, ge=1)
-    stock_seconds: int = Field(default=60, ge=60)
+    stock_seconds: int = Field(default=60, ge=15)
     option_seconds: int = Field(default=900, ge=60)
     reconcile_seconds: int = Field(default=60, ge=10)
     score_threshold: float = Field(default=100, ge=0)

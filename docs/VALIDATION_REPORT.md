@@ -158,3 +158,21 @@ mode resumed with passing held-portfolio risk checks. In that sample the new
 ETFs were not selected: the best modeled improvement was below the unchanged
 $100 threshold. Do not infer that adding instruments necessarily increases
 trading or recovers existing NAV deviation.
+
+## Faster target-aware paper profile
+
+The operator selected stock/ETF evaluation every 15 seconds, full-portfolio
+optimization every 120 seconds, and a $25 score-improvement floor. Uncertainty
+allowances and hard risk limits remain enforced. The dashboard and decision
+records expose the full NAV gap, hold-versus-trade expected closing distance,
+optimization scope, and the specific blocking reason.
+
+Regression checks cover continuing evaluations after previous trades, independent
+full-portfolio scheduling, nonoverlapping execution plans, and using a $4,000 NAV
+deficit in the optimization objective. The positive-return deficit fixture
+validates mechanics only; it is not a market prediction or evidence of recovery
+performance. See FAST_PAPER_POLICY.md.
+
+The final full suite passed **116 tests with zero failures or skips**, including
+isolated PostgreSQL integration. JavaScript syntax, dashboard-control regression,
+Ruff and whitespace checks also passed.

@@ -404,3 +404,26 @@ async def test_corrective_activation_requires_feasible_first_slice(store, manife
         await service.control("paper")
     assert service.mode == "PAUSED" and service.execution.paused
     assert not service.broker.orders
+
+
+def test_fast_policy_continues_evaluation_after_prior_trade(store, manifest, monkeypatch):
+    from hedge.config import TradingPolicy
+
+    m = manifest.model_copy(
+        update={"policy": TradingPolicy(stock_seconds=15, option_seconds=120, score_threshold=25)}
+    )
+    service = TradingService(m, store, demo=True)
+    clock = [1000.0]
+    monkeypatch.setattr("hedge.service.time.monotonic", lambda: clock[0])
+    service.last_optimization = {"STK": 1000.0, "OPT": 1000.0}
+    service.last_trade = {"STK": 1000.0, "OPT": 1000.0}
+    assert not service.optimization_due()
+    clock[0] = 1015.0
+    assert service.optimization_due()
+    service.last_optimization["STK"] = clock[0]
+    assert not service.optimization_due()
+    clock[0] = 1120.0
+    service.last_optimization["STK"] = clock[0]
+    assert service.optimization_due()  # full portfolio independently due
+    service.pending_target = object()
+    assert not service.optimization_due()  # never overlap execution plans

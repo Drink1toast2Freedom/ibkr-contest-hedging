@@ -42,8 +42,9 @@ intraday option history takes precedence when supplied.
 These are forecast assumptions, not demonstrated contest performance. A broader
 universe cannot guarantee reaching the closing target or repairing earlier NAV
 changes. No-trade remains a valid outcome if candidates do not improve expected
-score enough after costs and uncertainty. The $100 improvement floor, 20% local
-residual-delta cap and 3% stress-loss cap remain unchanged.
+score enough after costs and uncertainty. The current practice improvement floor is $25, with an unchanged uncertainty
+allowance, 20% local residual-delta cap and 3% stress-loss cap. See
+FAST_PAPER_POLICY.md for the operator-selected faster evaluation schedule.
 
 Tests cover read-only discovery, mandatory protection, multi-underlying scenario
 coverage, deterministic covariance/shocks, future-row exclusion, missing-history
