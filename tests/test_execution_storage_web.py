@@ -227,6 +227,8 @@ async def test_paper_activation_can_correct_existing_delta_breach(store, manifes
     assert service.last_target.status == "OPTIMAL"
     assert service.pending_target is service.last_target
     assert store.records("decision", manifest.account)
+    assert store.records("decision", manifest.account)[0]["corrective"]
+    assert not store.records("decision", manifest.account)[0]["blocking_reasons"]
     assert not service.broker.orders  # Activation itself never transmits.
     candidates = service.execution.feasible_slices(
         service.last_target, snapshot, service.last_quotes, service.last_scenarios, now

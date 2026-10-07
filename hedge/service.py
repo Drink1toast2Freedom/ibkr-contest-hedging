@@ -468,6 +468,9 @@ class TradingService:
                 self.manifest.policy.score_threshold,
                 self.manifest.policy.uncertainty_multiplier * target.uncertainty,
             )
+            corrective = not self.gate.engine.evaluate(
+                newest, self.broker.quotes(), scenarios, newest.quantities()
+            ).passed
             record = {
                 **target.model_dump(mode="json"),
                 "risk_passed": gate.passed,
@@ -476,12 +479,8 @@ class TradingService:
                 "threshold": threshold,
                 "trade_eligible": gate.passed
                 and target.status == "OPTIMAL"
-                and (
-                    improvement > threshold
-                    or not self.gate.engine.evaluate(
-                        newest, self.broker.quotes(), scenarios, newest.quantities()
-                    ).passed
-                ),
+                and (improvement > threshold or corrective),
+                "corrective": corrective,
                 "nav_gap": estimate - float(previous),
                 "closing_target": float(previous),
                 "optimization_scope": "FULL" if full else "STOCK",
@@ -492,7 +491,7 @@ class TradingService:
                     + ([f"Solver: {target.status}"] if target.status != "OPTIMAL" else [])
                     + (
                         [f"Modeled improvement ${improvement:.2f} does not exceed threshold ${threshold:.2f}"]
-                        if improvement <= threshold and gate.passed
+                        if improvement <= threshold and gate.passed and not corrective
                         else []
                     )
                 ),
