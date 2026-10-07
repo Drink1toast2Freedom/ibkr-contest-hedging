@@ -176,3 +176,11 @@ performance. See FAST_PAPER_POLICY.md.
 The final full suite passed **116 tests with zero failures or skips**, including
 isolated PostgreSQL integration. JavaScript syntax, dashboard-control regression,
 Ruff and whitespace checks also passed.
+
+During live activation, an overlapping broker reconciliation timed out. Broker
+and service downloads are now serialized; timeout/disconnection returns an
+explicit 503 blocked-activation response instead of a raw server error. A
+concurrency regression confirms only one IBKR download is in flight.
+
+After the reconciliation fix, the complete suite passed **117 tests with zero
+failures or skips**, including isolated PostgreSQL.

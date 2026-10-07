@@ -429,3 +429,20 @@ def test_fast_policy_continues_evaluation_after_prior_trade(store, manifest, mon
     assert service.optimization_due()  # full portfolio independently due
     service.pending_target = object()
     assert not service.optimization_due()  # never overlap execution plans
+
+
+async def test_overlapping_ibkr_reconciliations_are_serialized(manifest, monkeypatch):
+    broker = IBKRBroker(manifest, asyncio.Queue())
+    in_flight = [0]
+    maximum = [0]
+
+    async def download():
+        in_flight[0] += 1
+        maximum[0] = max(maximum[0], in_flight[0])
+        await asyncio.sleep(0.01)
+        in_flight[0] -= 1
+        return "snapshot"
+
+    monkeypatch.setattr(broker, "_download_state", download)
+    assert await asyncio.gather(broker.reconcile(), broker.reconcile()) == ["snapshot", "snapshot"]
+    assert maximum[0] == 1

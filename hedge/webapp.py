@@ -124,6 +124,11 @@ def create_app(service):
             return await service.control(body.action, body.profile)
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
+        except (TimeoutError, ConnectionError) as exc:
+            raise HTTPException(
+                503,
+                "Broker reconciliation timed out or disconnected; activation blocked. Reconcile before retrying.",
+            ) from exc
 
     @app.post("/api/closes")
     async def import_close(body: CloseImport):

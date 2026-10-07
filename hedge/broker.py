@@ -38,6 +38,7 @@ class IBKRBroker:
         self.readonly = True
         self.qualified = False
         self.reconciled = False
+        self.reconcile_lock = asyncio.Lock()
         self.account_at = datetime.min.replace(tzinfo=timezone.utc)
         self.quote_times, self.greek_times = {}, {}
         self.ticks_by_contract = {}
@@ -183,6 +184,12 @@ class IBKRBroker:
         await self.reconcile()
 
     async def reconcile(self):
+        # Several IB requests use one global completion future. Overlapping
+        # downloads can overwrite it and strand a caller until timeout.
+        async with self.reconcile_lock:
+            return await self._download_state()
+
+    async def _download_state(self):
         self.reconciled = False
         await self.ib.reqPositionsAsync()
         await self.ib.reqAllOpenOrdersAsync()

@@ -71,6 +71,7 @@ class TradingService:
         self.market_data_log = None
         self.decision_lock = asyncio.Lock()
         self.control_lock = asyncio.Lock()
+        self.reconcile_lock = asyncio.Lock()
         self.writer_file = None
         self.pg_lock = None
         self.force_optimize = False
@@ -231,6 +232,10 @@ class TradingService:
             self.store.record("alert", self.manifest.account, {"severity": severity, "message": message})
 
     async def reconcile(self):
+        async with self.reconcile_lock:
+            return await self._reconcile()
+
+    async def _reconcile(self):
         prior = self.last_snapshot.quantities() if self.last_snapshot else None
         snapshot = await asyncio.wait_for(self.broker.reconcile(), 30)
         await self.events.join()
