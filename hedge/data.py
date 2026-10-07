@@ -13,13 +13,14 @@ class QuoteRecorder:
             self.buffer.append(
                 {
                     **q.model_dump(mode="json"),
-                    "timestamp": at.isoformat(),
+                    "timestamp": q.observed_at.isoformat(),
+                    "recorded_at": at.isoformat(),
                     "symbol": contracts[i].symbol,
                     "kind": contracts[i].kind,
                     "expiry": str(contracts[i].expiry),
                     "strike": contracts[i].strike,
                     "right": contracts[i].right,
-                    "source": q.data_type,
+                    "source": q.provider,
                 }
             )
         if len(self.buffer) >= 1000:

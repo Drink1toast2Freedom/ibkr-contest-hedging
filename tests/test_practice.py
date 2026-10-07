@@ -238,3 +238,40 @@ async def test_opening_purchase_arm_is_cancelled_by_pause(manifest, store):
     await service.control("pause")
     assert not service.setup_armed and not service.auto_hedge_after_setup
     assert service.mode == "PAUSED"
+
+
+async def test_moving_prices_do_not_churn_stock_and_starve_mandatory_setup(manifest, store):
+    service = TradingService(manifest, store, demo=True, rehearsal=True)
+    now = datetime.combine(manifest.day_zero, datetime.min.time(), NY).replace(hour=10)
+    service.now = lambda: now
+    broker = service.broker
+    await broker.connect()
+    quotes = demo_quotes(manifest, now)
+    broker.update_quotes(quotes, now)
+    service.last_snapshot = broker.snapshot()
+    service.last_quotes = quotes
+    service.last_scenarios = ScenarioEngine(manifest).build(broker.snapshot(), quotes, now)
+    await service.control("setup")
+    initial = dict(service.setup_target_quantities)
+    for n in range(60):
+        quotes = demo_quotes(manifest, now, n * 25)
+        broker.update_quotes(quotes, now)
+        service.last_quotes = quotes
+        service.last_scenarios = ScenarioEngine(manifest).build(broker.snapshot(), quotes, now)
+        await service._setup_slice()
+        for order in list(broker.orders):
+            await broker.fill(order)
+        while not service.events.empty():
+            name, event = service.events.get_nowait()
+            if name == "execution":
+                store.execution(event)
+                service.execution.on_execution(event)
+            elif name == "order":
+                service.execution.on_order(event)
+            service.events.task_done()
+        if service.mode == "SHADOW":
+            break
+    assert service.mode == "SHADOW"
+    assert {i: broker.positions.get(i, 0) for i in manifest.mandatory} == manifest.mandatory
+    assert broker.positions.get(10, 0) == initial.get(10, 0)
+    assert len([r for r in store.fills(manifest.account) if r["con_id"] == 10]) <= 2

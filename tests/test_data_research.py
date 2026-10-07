@@ -85,3 +85,39 @@ def test_historical_matching_only_uses_day_zero_available_contracts(manifest):
     matched = match_window(manifest, frame, [manifest.day_zero, *manifest.scoring_sessions], {"BA": 195})
     assert matched.mandatory == manifest.mandatory
     assert all(i not in matched.allowlist for i in matched.mandatory)
+
+
+def test_quote_archive_preserves_provider_time_and_rejects_frozen_research(tmp_path, manifest, now):
+    from datetime import timedelta
+
+    from hedge.data import QuoteRecorder
+
+    q = demo_quotes(manifest, now)[10].model_copy(
+        update={"provider": "moomoo", "data_type": "frozen", "observed_at": now - timedelta(minutes=20)}
+    )
+    recorder = QuoteRecorder(tmp_path)
+    recorder.append({10: q}, manifest.contract_map, now)
+    recorder.flush()
+    frame = pd.read_parquet(next(tmp_path.glob("*.parquet")))
+    assert pd.Timestamp(frame.iloc[0].timestamp) == pd.Timestamp(q.observed_at)
+    assert pd.Timestamp(frame.iloc[0].recorded_at) == pd.Timestamp(now)
+    assert frame.iloc[0].source == "moomoo"
+    with pytest.raises(ValueError, match="Frozen/delayed"):
+        normalized_quotes(frame)
+
+
+def test_historical_matching_keeps_official_daily_rate_rule(manifest):
+    from decimal import Decimal
+
+    template = manifest.model_copy(
+        update={
+            "scoring_rule": "actual_daily_cash_rate",
+            "scoring_daily_rates": {d: Decimal("0.0001") for d in manifest.scoring_sessions},
+        }
+    )
+    frame = normalized_quotes(archive(template))
+    matched = match_window(
+        template, frame[frame.kind == "OPT"], [template.day_zero, *template.scoring_sessions], {"BA": 195}
+    )
+    assert matched.scoring_rule == "actual_daily_cash_rate"
+    assert matched.scoring_daily_rates == template.scoring_daily_rates

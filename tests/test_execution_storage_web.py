@@ -295,3 +295,46 @@ def test_dashboard_controls_recover_stale_tokens_and_show_rejections():
         timeout=10,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+async def test_working_order_is_cancelled_when_quote_becomes_nonlive(store, manifest, snapshot, quotes, now):
+    from datetime import timedelta
+
+    queue = asyncio.Queue()
+    broker = SimBroker(manifest, queue, now)
+    await broker.connect()
+    broker.update_quotes(quotes, now)
+    broker.readonly = False
+    manager = ExecutionManager(manifest, store, broker, RiskGate(manifest, demo=True))
+    r = request(manifest, snapshot)
+    store.create_intent(r)
+    store.transition(r.intent_id, "VALIDATED")
+    store.transition(r.intent_id, "SUBMITTING", 1)
+    await broker.submit(r, 1)
+    manager.on_order(queue.get_nowait()[1])
+    manager.sent_at[r.intent_id] = now
+    await manager.manage(
+        {10: quotes[10].model_copy(update={"data_type": "frozen"})}, now + timedelta(seconds=1)
+    )
+    assert store.intents(manifest.account)[0]["state"] == "CANCEL_PENDING"
+    assert 1 not in broker.orders
+    assert 10 not in broker.positions
+
+
+async def test_margin_preview_uses_same_explicit_tif_as_execution(manifest, snapshot):
+    from types import SimpleNamespace
+
+    broker = IBKRBroker(manifest, asyncio.Queue())
+    broker.native[10] = object()
+
+    class PreviewOnly:
+        async def whatIfOrderAsync(self, native, order):
+            assert order.tif == "DAY"
+            assert order.outsideRth is False
+            assert order.account == manifest.account
+            assert order.orderType == "LMT"
+            return SimpleNamespace(initMarginChange="100", warningText="")
+
+    broker.ib = PreviewOnly()
+    result = await broker.margin_preview(request(manifest, snapshot))
+    assert result.initMarginChange == "100"

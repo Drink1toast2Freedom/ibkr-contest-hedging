@@ -291,6 +291,7 @@ class IBKRBroker:
                     "model_price": g.optPrice if finite(g.optPrice) else None,
                 }
             result[i] = Quote(
+                provider="ibkr",
                 con_id=i,
                 bid=t.bid,
                 ask=t.ask,
@@ -407,6 +408,8 @@ class IBKRBroker:
             abs(request.signed_quantity),
             float(request.limit_price),
             account=request.account,
+            tif="DAY",
+            outsideRth=False,
         )
         return await self.ib.whatIfOrderAsync(self.native[request.con_id], order)
 

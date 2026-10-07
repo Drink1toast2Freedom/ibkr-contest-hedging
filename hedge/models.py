@@ -66,6 +66,7 @@ class Quote(Frozen):
     ask_size: int = Field(ge=0)
     observed_at: datetime
     data_type: Literal["live", "delayed", "frozen", "synthetic"] = "live"
+    provider: Literal["ibkr", "moomoo", "synthetic", "cboe_datashop", "unknown"] = "unknown"
     spot: float = Field(gt=0)
     iv: float | None = Field(default=None, gt=0)
     delta: float = 1

@@ -87,6 +87,7 @@ class MoomooData:
                         )
                         greeks = self.engine.greeks(contract, spot, iv, now if live else at)
                     quotes[contract.con_id] = Quote(
+                        provider="moomoo",
                         con_id=contract.con_id,
                         bid=bid,
                         ask=ask,

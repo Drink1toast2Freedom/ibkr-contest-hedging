@@ -61,6 +61,7 @@ def demo_quotes(manifest, now, elapsed=0):
         greeks = valuation.greeks(c, spot, iv, now) if c.kind == "OPT" else {}
         spread = 0.08 if c.kind == "OPT" else 0.02
         quotes[c.con_id] = Quote(
+            provider="synthetic",
             con_id=c.con_id,
             bid=max(0.01, price - spread / 2),
             ask=price + spread / 2,

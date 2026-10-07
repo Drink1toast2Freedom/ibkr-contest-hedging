@@ -31,6 +31,8 @@ class Variant:
 
 def normalized_quotes(frame):
     frame = frame.copy()
+    if "data_type" in frame and frame.data_type.isin(["frozen", "delayed"]).any():
+        raise ValueError("Frozen/delayed snapshots cannot establish historical trading performance")
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
     frame["day"] = frame.timestamp.dt.tz_convert(NY).dt.date
     if "con_id" not in frame:
@@ -114,6 +116,11 @@ def match_window(template, frame, days, reference_spots):
         scoring_sessions=scored,
         valuation_convention="Archived midpoint NAV proxy; not official IBKR marks",
         report_source="Historical NBBO replay",
+        scoring_rule=template.scoring_rule,
+        scoring_annual_rate=template.scoring_annual_rate,
+        scoring_daily_rates={d: r for d, r in template.scoring_daily_rates.items() if d in scored},
+        scoring_forecast_daily_rate=template.scoring_forecast_daily_rate,
+        scoring_forecast_source=template.scoring_forecast_source,
         contracts=tuple(contracts.values()),
         mandatory=mandatory,
         allowlist=tuple(i for i in contracts if i not in mandatory),

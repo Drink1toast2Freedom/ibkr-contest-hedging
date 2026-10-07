@@ -78,6 +78,7 @@ class TradingService:
         self.last_decision_id = None
         self.active_plan_started = False
         self.setup_armed = False
+        self.setup_target_quantities = None
         self.auto_hedge_after_setup = False
         self.market_data_errors = {}
 
@@ -313,7 +314,7 @@ class TradingService:
                     self.ready = (
                         not mandate_errors and self.last_risk.passed and not self.execution.unresolved()
                     )
-                    if self.mode == "PAPER" and self.last_snapshot.orders:
+                    if self.mode in ("PAPER", "SETUP") and self.last_snapshot.orders:
                         projected_check = self.gate.validate(
                             self.last_snapshot,
                             self.last_quotes,
@@ -321,6 +322,7 @@ class TradingService:
                             self.last_snapshot.projected(),
                             self.now(),
                             corrective=not self.last_risk.passed,
+                            day_zero=self.mode == "SETUP",
                         )
                         if not projected_check.passed:
                             await self.execution.pause()
@@ -583,7 +585,9 @@ class TradingService:
         snap = self.broker.snapshot()
         if snap.orders or self.store.intents(snap.account, True):
             return
-        desired = self._setup_quantities(snap, self.broker.quotes())
+        if self.setup_target_quantities is None:
+            self.setup_target_quantities = self._setup_quantities(snap, self.broker.quotes())
+        desired = dict(self.setup_target_quantities)
         complete = not self.gate.registry.check(snap.quantities())
         risk_ok = (
             self.gate.validate(
@@ -647,12 +651,14 @@ class TradingService:
     async def control(self, action, profile=None):
         async with self.control_lock:
             if action == "pause":
+                self.setup_target_quantities = None
                 self.setup_armed = self.auto_hedge_after_setup = False
                 self.store.record("setup_schedule", self.manifest.account, {"status": "CANCELLED"})
                 self.mode = "PAUSED"
                 self.pending_target = None
                 await self.execution.pause()
             elif action == "shadow":
+                self.setup_target_quantities = None
                 self.setup_armed = self.auto_hedge_after_setup = False
                 await self.execution.pause()
                 if self.store.intents(self.manifest.account, True):
@@ -746,6 +752,17 @@ class TradingService:
                     )
                     if not preflight.passed:
                         raise ValueError("Mandatory portfolio preflight: " + "; ".join(preflight.reasons))
+                    self.setup_target_quantities = dict(proposed)
+                    self.store.record(
+                        "setup_plan",
+                        snapshot.account,
+                        {
+                            "quantities": proposed,
+                            "snapshot_id": snapshot.version,
+                            "config_hash": self.manifest.config_hash,
+                            "explanation": "Freeze initial delta hedge during mandatory construction; risk rechecked on each slice",
+                        },
+                    )
                 self.broker.readonly = False
                 self.execution.paused = self.execution.pause_requested = False
                 self.setup_armed = False

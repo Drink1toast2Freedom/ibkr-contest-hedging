@@ -319,6 +319,23 @@ class ExecutionManager:
                     self.paused = True
                 continue
             sent = self.sent_at.get(row["id"])
+            q = quotes.get(row["con_id"])
+            c = self.manifest.contract_map[row["con_id"]]
+            age = (
+                self.manifest.risk.option_quote_age if c.kind == "OPT" else self.manifest.risk.stock_quote_age
+            )
+            allowed = "synthetic" if self.gate.demo else "live"
+            if (
+                q is None
+                or q.data_type != allowed
+                or not timedelta(0) <= now - q.observed_at <= timedelta(seconds=age)
+            ):
+                self.store.transition(row["id"], "CANCEL_PENDING")
+                try:
+                    await self.broker.cancel(row["broker_order_id"])
+                except Exception:
+                    self.paused = True
+                continue
             if sent is None or now - sent >= timedelta(seconds=30):
                 self.store.transition(row["id"], "CANCEL_PENDING")
                 try:
@@ -327,15 +344,6 @@ class ExecutionManager:
                     self.paused = True
                 continue
             if now - sent >= timedelta(seconds=10) and row["id"] not in self.repriced:
-                q = quotes.get(row["con_id"])
-                c = self.manifest.contract_map[row["con_id"]]
-                age = (
-                    self.manifest.risk.option_quote_age
-                    if c.kind == "OPT"
-                    else self.manifest.risk.stock_quote_age
-                )
-                if q is None or (now - q.observed_at).total_seconds() > age:
-                    continue
                 price = q.ask if row["signed_quantity"] > 0 else q.bid
                 collar = max(0.01, (q.ask - q.bid) * 2)
                 if price > 0 and abs(price - float(row["limit_price"])) <= collar:
