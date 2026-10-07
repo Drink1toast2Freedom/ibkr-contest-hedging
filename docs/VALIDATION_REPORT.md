@@ -125,3 +125,14 @@ validation of the operator limit.
 
 The final full regression run passed **109 tests with zero failures or skips**,
 including the isolated PostgreSQL integration test.
+
+## Operator freshness adjustment
+
+At the operator's request, option book freshness is now **60 seconds**, replacing
+30 seconds in the application default and local practice configuration. The
+stock-book limit remains 5 seconds; the Greek limit remains 60 seconds. This
+accepts older option books and therefore increases exposure to quote changes
+between updates; permission, identity, spread, liquidity and risk checks remain
+in force. Boundary regression accepts a 60-second option book with a fresh
+underlying and rejects it at 61 seconds. The focused feed/valuation/optimizer/risk
+suite passed **31 tests**.

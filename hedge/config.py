@@ -25,7 +25,7 @@ class RiskLimits(Frozen):
     contracts_per_option: int = Field(default=50, gt=0, le=50)
     option_names: int = Field(default=6, gt=0, le=6)
     stock_quote_age: int = Field(default=5, gt=0)
-    option_quote_age: int = Field(default=30, gt=0)
+    option_quote_age: int = Field(default=60, gt=0)
     greek_age: int = Field(default=60, gt=0)
     account_age: int = Field(default=180, gt=0)
 

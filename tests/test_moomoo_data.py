@@ -175,3 +175,35 @@ def test_old_source_book_time_is_not_hidden_by_new_callback(tmp_path):
     source = now - timedelta(minutes=15)
     item["order_book"]["svr_recv_time_bid"] = source.isoformat()
     assert MoomooData.book_time(item) == source
+
+
+def test_option_book_one_minute_boundary_with_fresh_underlying(tmp_path):
+    from datetime import datetime
+
+    m = demo_manifest()
+    assert m.risk.option_quote_age == 60
+    now = datetime.combine(m.scoring_sessions[0], datetime.min.time(), NY).replace(hour=10)
+    raw = fixture(m, now)
+    raw.update(
+        quote_server_connected=True,
+        rights={"us_qot_right": "LV3", "us_option_qot_right": "LV1"},
+        identities={},
+    )
+    for c in m.contracts:
+        item = raw["securities"][code_for(c)]
+        book_at = now - timedelta(seconds=60) if c.kind == "OPT" else now
+        item.update(book_push_at=book_at.isoformat(), book_push_count=2)
+        if c.kind == "OPT":
+            raw["identities"][code_for(c)] = {
+                "stock_owner": "US.BA",
+                "strike_time": str(c.expiry),
+                "option_type": "CALL" if c.right == "C" else "PUT",
+                "strike_price": c.strike,
+            }
+    path = tmp_path / "quotes.json"
+    path.write_text(json.dumps(raw))
+    feed = MoomooData(m, path)
+    assert all(q.data_type == "live" for q in feed.quotes(now).values())
+    quotes = feed.quotes(now + timedelta(seconds=1))
+    assert quotes[10].data_type == "live"
+    assert all(q.data_type == "frozen" for i, q in quotes.items() if i != 10)
