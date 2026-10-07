@@ -6,6 +6,7 @@ import pytest
 
 from hedge.models import Contract
 from hedge.optimizer import HedgeOptimizer
+from hedge.risk import RiskGate
 from hedge.scenarios import ScenarioEngine
 from hedge.universe import screen_options
 from hedge.universe_discovery import qualify_stock_universe
@@ -104,3 +105,61 @@ def test_cross_underlying_activation_requires_joint_history(manifest, snapshot, 
     quotes = {**quotes, 200: quotes[10].model_copy(update={"con_id": 200})}
     with pytest.raises(ValueError, match="Joint historical coverage required"):
         ScenarioEngine(m).build(snapshot, quotes, now)
+
+
+def test_related_stocks_use_measured_joint_signs_and_combined_limits(
+    manifest, snapshot, quotes, now, tmp_path
+):
+    """A negative relationship enters scenarios without granting unrestricted trades."""
+    additions = (
+        Contract(con_id=200, symbol="UAL", kind="STK"),
+        Contract(con_id=201, symbol="GE", kind="STK"),
+        Contract(con_id=202, symbol="XLE", kind="STK"),
+    )
+    rng = np.random.default_rng(42)
+    days = pd.bdate_range(end=pd.Timestamp(now.date()) - pd.Timedelta(days=1), periods=70)
+    factor = rng.normal(0, 0.012, len(days))
+    records = []
+    for symbol, beta in (("BA", 1.0), ("UAL", 0.9), ("GE", 1.1), ("XLE", -0.8)):
+        prices = 100 * np.exp(np.cumsum(beta * factor + rng.normal(0, 0.002, len(days))))
+        records.extend(
+            {"date": str(day.date()), "symbol": symbol, "close": price}
+            for day, price in zip(days, prices, strict=True)
+        )
+    path = tmp_path / "related.csv"
+    pd.DataFrame(records).to_csv(path, index=False)
+    m = type(manifest).model_validate(
+        {
+            **manifest.model_dump(),
+            "contracts": (*manifest.contracts, *additions),
+            "allowlist": (*manifest.allowlist, *(c.con_id for c in additions)),
+            "daily_stock_history": str(path),
+        }
+    )
+    qs = dict(quotes)
+    for contract, price in zip(additions, (100, 300, 90), strict=True):
+        qs[contract.con_id] = quotes[10].model_copy(
+            update={
+                "con_id": contract.con_id,
+                "spot": price,
+                "bid": price - 0.01,
+                "ask": price + 0.01,
+                "shortable_shares": None,
+            }
+        )
+    engine = ScenarioEngine(m)
+    covariance = engine.daily_covariance(now, ["BA", "UAL", "GE", "XLE"])
+    assert covariance[0, 1] > 0 and covariance[0, 2] > 0 and covariance[0, 3] < 0
+    ids = screen_options(m, qs, snapshot.quantities())
+    scenarios = engine.build(snapshot, qs, now, ids)
+    assert all(c.con_id in scenarios.ids for c in additions)
+    ba = scenarios.changes[:, scenarios.ids.index(10)]
+    energy = scenarios.changes[:, scenarios.ids.index(202)]
+    assert np.corrcoef(ba, energy)[0, 1] < 0
+    target = HedgeOptimizer(m).solve(snapshot, qs, scenarios, m.initial_nav)
+    assert target.status == "OPTIMAL"
+    assert all(target.quantities[i] == amount for i, amount in m.mandatory.items())
+    assert all(target.quantities.get(c.con_id, 0) >= 0 for c in additions)
+    assert RiskGate(m).validate(
+        snapshot, qs, scenarios, target.quantities, now, target.estimated_cost
+    ).passed

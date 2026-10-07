@@ -221,3 +221,23 @@ position and execution synchronization timeouts despite the reachable TWS socket
 No fresh reconciliation or new recovery execution is claimed. Restoring the
 authenticated Paper TWS session and passing reconciliation are required before
 ordinary paper activation. Recovery remains shadow pending empirical promotion.
+
+## Related stocks applied
+
+UAL, GE and XLE were qualified read-only through IBKR and deployed as ordinary
+hedge candidates, with aligned ten-symbol history and quote-only moomoo
+subscriptions. The 37 focused universe/valuation/optimizer/risk/feed tests passed,
+including a new measured-sign scenario and combined-limit regression. No
+production risk limit, scoring rule or recovery forecast was changed.
+
+A synthetic seven-versus-ten-symbol fixture returned OPTIMAL for stock and full
+solves within the deadline, preserving mandates and numerical risk limits. The
+ten-symbol stock/full solves took 0.68/1.41 seconds; this is mechanics/latency
+evidence only. See EXPANDED_UNIVERSE.md for inputs and restrictions.
+
+IBKR synchronization recovered: reconciliation verified mandatory holdings,
+zero working orders and zero unresolved intents before deployment. The restarted
+dashboard shows UAL, GE and XLE; main operation and recovery are shadow after
+market close. Fresh execution data will require regular-session verification.
+Crossed after-hours samples were rejected, not relabeled live or repaired to
+create apparent fills. No new positions were acquired during deployment.

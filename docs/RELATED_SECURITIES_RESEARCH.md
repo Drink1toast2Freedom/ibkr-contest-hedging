@@ -1,7 +1,10 @@
 # Related and inverse securities: BA contest research
 
-Research date: October 7, 2026. This is a candidate assessment, not a trading
-activation. The active manifest, forecasts and risk limits were not changed.
+Research date: October 7, 2026. The original assessment made no trading changes.
+The operator subsequently authorized applying UAL, GE and XLE: they are now in
+the hedge allowlist and quote subscriptions. See
+[EXPANDED_UNIVERSE.md](EXPANDED_UNIVERSE.md) for deployment validation.
+Recovery forecasts and hard limits are unchanged; operation remains shadow after close.
 Data acquisition used moomoo OpenQuoteContext only; no trades were submitted.
 
 ## Recommendation
@@ -158,4 +161,5 @@ Source: [Boeing acquisition announcement](https://boeing.mediaroom.com/2025-12-0
 This extension uses existing stock/ETF interfaces and needs no new account,
 second trading computer or independent optimizer. It does require data and
 validation. No empirical combined-option contest improvement has been established
-by this correlation study, and no new ticker was activated during this request.
+by this correlation study. Only the first three hedge candidates were subsequently
+applied; no new recovery signal or paper-recovery profile was promoted.

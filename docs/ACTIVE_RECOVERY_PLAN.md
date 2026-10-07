@@ -92,8 +92,10 @@ requires special treatment in this practice. No ordinary stock screened provides
 a strong, stable natural inverse BA relationship. SH remains an unapproved
 inverse-market research benchmark requiring separate reset validation.
 
-These candidates extend the hedge research pool, not the active execution
-allowlist or SPY/QQQ recovery forecasts. Compare repriced combined option P&L and
+The operator subsequently approved UAL, GE and XLE for the ordinary hedge
+allowlist; qualification, joint history, shadow deployment and latency checks
+are recorded in EXPANDED_UNIVERSE.md. Other names remain research alternatives;
+SPY/QQQ recovery forecasts are unchanged. Compare repriced combined option P&L and
 official score after costs, validate intraday relationships and forecasts, then
 use existing shadow/promotion gates. Correlation with BA shares alone is not
 evidence of reduced straddle risk or expected deficit recovery. Retain the current
