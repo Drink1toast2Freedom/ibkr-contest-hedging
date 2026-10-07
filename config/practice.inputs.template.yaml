@@ -1,0 +1,15 @@
+# Rule intake for read-only prepare-practice. Nulls intentionally block connection/activation.
+# Resolve the instructor's contradictory expiry/calendar before setting rules_confirmed: true.
+rules_confirmed: false
+account: null  # Discover automatically only if exactly one DU paper account is accessible.
+day_zero: null
+scoring_sessions: []  # Explicit scored sessions, excluding Day 0.
+expiry: null
+strike: 195
+call_quantity: 25
+put_quantity: 25
+multiplier: 100
+purchase_on_day: 0  # Normal Day 0 purchase; Day 1 requires an explicit late-start instruction.
+report_source: null  # Identify the official organizer/IBKR NAV report.
+gateway_port: 7497  # Local paper TWS; paper Gateway uses 4002.
+client_id: 72

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.contesthedge.service</string>
+<key>ProgramArguments</key><array><string>PROJECT/.venv/bin/python</string><string>-m</string><string>hedge.cli</string><string>serve</string><string>--config</string><string>PROJECT/config/local.contest.yaml</string></array>
+<key>WorkingDirectory</key><string>PROJECT</string>
+<key>EnvironmentVariables</key><dict><key>HEDGE_DATABASE_URL</key><string>POSTGRES_URL</string></dict>
+<key>KeepAlive</key><true/><key>RunAtLoad</key><true/>
+<key>StandardOutPath</key><string>PROJECT/data/service.log</string>
+<key>StandardErrorPath</key><string>PROJECT/data/service-error.log</string>
+</dict></plist>

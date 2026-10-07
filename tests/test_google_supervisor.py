@@ -1,0 +1,158 @@
+import asyncio
+import json
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from hedge.demo import demo_manifest
+from hedge.service import TradingService
+from hedge.storage import Store
+from hedge.supervisor import MODELS, Supervisor
+from hedge.webapp import create_app
+
+
+def state():
+    return {
+        "snapshot_id": "abc",
+        "mode": "PAUSED",
+        "account": "PRIVATE",
+        "connected": True,
+        "ready": False,
+        "quote_count": 0,
+        "health": "private broker string",
+        "scores": {"scoring_rule": "pending_interest_adjustment"},
+        "market_data_errors": [{"message": "private"}],
+        "positions": [{"quantity": 25}],
+        "decisions": [{"status": "BLOCKED", "explanation": "untrusted"}],
+    }
+
+
+def response(profile="STANDARD", snapshot="abc", **extra):
+    text = json.dumps(
+        {"snapshot_id": snapshot, "profile": profile, "explanation": "Missing quotes.", **extra}
+    )
+    return {
+        "status": "completed",
+        "steps": [{"type": "model_output", "content": [{"type": "text", "text": text}]}],
+        "usage": {"total_tokens": 20},
+    }
+
+
+@pytest.mark.asyncio
+async def test_google_payload_privacy_tools_and_cooldown(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-credential")
+    calls = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        assert request.url.host == "generativelanguage.googleapis.com"
+        assert request.headers["x-goog-api-key"] == "test-credential"
+        assert "test-credential" not in str(request.url)
+        assert payload["model"] == "gemini-3.8-flash"
+        assert payload["tools"] == [] and payload["store"] is False
+        assert payload["background"] is False
+        safe = json.loads(payload["input"])
+        assert "PRIVATE" not in payload["input"] and "private" not in payload["input"]
+        assert "untrusted" not in payload["input"] and "positions" not in safe
+        calls.append(payload)
+        return httpx.Response(200, json=response())
+
+    supervisor = Supervisor(transport=httpx.MockTransport(handler), settings_path=tmp_path / "ai.json")
+    result = await supervisor.review(state())
+    assert result["model"] == MODELS[0] and result["advisory_only"]
+    assert "test-credential" not in json.dumps(result) + json.dumps(supervisor.status())
+    assert await supervisor.review(state()) is None
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        response(profile="GREEK_NEUTRAL"),
+        response(snapshot="old"),
+        response(positions={"BA": 100}),
+        {"status": "requires_action", "steps": []},
+    ],
+)
+async def test_unvalidated_or_trade_outputs_rejected(tmp_path, monkeypatch, body):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-credential")
+    supervisor = Supervisor(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=body)),
+        settings_path=tmp_path / "ai.json",
+    )
+    with pytest.raises(ValueError):
+        await supervisor.review(state())
+    assert await supervisor.review(state()) is None
+
+
+@pytest.mark.asyncio
+async def test_google_failure_never_echoes_secret_or_response(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-credential")
+    supervisor = Supervisor(
+        transport=httpx.MockTransport(lambda r: httpx.Response(401, text="test-credential")),
+        settings_path=tmp_path / "ai.json",
+    )
+    with pytest.raises(ValueError, match="HTTP 401") as error:
+        await supervisor.review(state())
+    assert "test-credential" not in str(error.value) + str(supervisor.status())
+
+
+def test_private_key_and_settings(tmp_path, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    supervisor = Supervisor(settings_path=tmp_path / "ai.json")
+    supervisor.key_path = tmp_path / "key"
+    supervisor.key_path.write_text("test-credential")
+    supervisor.key_path.chmod(0o644)
+    assert not supervisor.enabled
+    supervisor.key_path.chmod(0o600)
+    assert supervisor.enabled
+    supervisor.configure(MODELS[1], False)
+    assert not supervisor.enabled
+    assert json.loads((tmp_path / "ai.json").read_text()) == {"model": MODELS[1], "enabled": False}
+    with pytest.raises(ValueError):
+        supervisor.configure("arbitrary-URL", True)
+
+
+@pytest.mark.asyncio
+async def test_service_review_while_paused_leaves_execution_unchanged(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    service = TradingService(demo_manifest(), Store(f"sqlite:///{tmp_path}/ai.db"), demo=True)
+    await service.start()
+    try:
+
+        async def fake_review(value):
+            return {"snapshot_id": value["snapshot_id"], "profile": "STANDARD", "explanation": "Read only."}
+
+        service.supervisor.review = fake_review
+        await asyncio.sleep(0.05)
+        before = service.mode, service.profile, service.broker.snapshot().quantities()
+        await service._review()
+        assert (service.mode, service.profile, service.broker.snapshot().quantities()) == before
+        assert service.store.records("supervisor", service.manifest.account, 1)
+    finally:
+        await service.stop()
+
+
+def test_model_selector_route_does_not_enable_trading(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-credential")
+    service = TradingService(demo_manifest(), Store(f"sqlite:///{tmp_path}/ui.db"), demo=True)
+    service.supervisor.active = False
+    with TestClient(create_app(service)) as client:
+        import re
+
+        page = client.get("/").text
+        assert 'id="ai-model"' in page
+        token = re.search(r'name="control-token" content="([^"]+)"', page).group(1)
+        before = service.mode
+        assert client.post("/api/ai/settings", json={"model": MODELS[1], "enabled": False}).status_code == 403
+        result = client.post(
+            "/api/ai/settings",
+            json={"model": MODELS[1], "enabled": False},
+            headers={"X-Control-Token": token},
+        )
+        assert result.status_code == 200 and result.json()["model"] == MODELS[1]
+        assert service.mode == before

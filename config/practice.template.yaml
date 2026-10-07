@@ -1,0 +1,17 @@
+# Deliberately incomplete. Copy to config/local.practice.yaml and obtain confirmed rules/IDs.
+# No date, expiry, or IBKR contract identifier is guessed.
+name: BA practice
+account: null
+environment: paper
+day_zero: null
+scoring_sessions: []
+valuation_convention: IBKR official closing account NAV
+report_source: null
+initial_nav: '1000000'
+confirmed: false
+contracts: []
+mandatory: {}  # Verified BA $195 call conId: 25; BA $195 put conId: 25
+allowlist: []  # BA stock and qualified, nonmandatory options
+strategy: dynamic_l1
+gateway_port: 4002
+client_id: 71

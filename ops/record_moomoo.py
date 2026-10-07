@@ -1,0 +1,145 @@
+"""Streaming quote-only worker. No moomoo trade context or account operations."""
+
+import argparse
+import fcntl
+import json
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
+
+
+def make_handlers(sdk, lock, securities, rights, stamp):
+    class Quotes(sdk.StockQuoteHandlerBase):
+        def on_recv_rsp(self, rsp):
+            ret, data = super().on_recv_rsp(rsp)
+            if ret == sdk.RET_OK:
+                with lock:
+                    for row in json.loads(data.to_json(orient="records")):
+                        code = row["code"]
+                        item = securities.setdefault(code, {})
+                        item["quote"] = [row]
+                        item["quote_push_at"] = stamp()
+            return ret, data
+
+    class Books(sdk.OrderBookHandlerBase):
+        def on_recv_rsp(self, rsp):
+            ret, data = super().on_recv_rsp(rsp)
+            if ret == sdk.RET_OK:
+                with lock:
+                    item = securities.setdefault(data["code"], {})
+                    item["order_book"] = data
+                    item["book_push_at"] = stamp()
+                    item["book_push_count"] = item.get("book_push_count", 0) + 1
+            return ret, data
+
+    class Notify(sdk.SysNotifyHandlerBase):
+        def on_recv_rsp(self, rsp):
+            ret, data = super().on_recv_rsp(rsp)
+            if ret == sdk.RET_OK and data.get("type") == sdk.SysNotifyType.QOT_RIGHT:
+                with lock:
+                    rights.update(
+                        {
+                            k: v
+                            for k, v in data.get("msg", {}).items()
+                            if k in ("us_qot_right", "us_option_qot_right")
+                        }
+                    )
+            return ret, data
+
+    return Quotes(), Books(), Notify()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--codes", default="config/local.moomoo-codes.json")
+    args = parser.parse_args()
+    codes = json.loads(Path(args.codes).read_text())
+    path = Path("data/moomoo/latest.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with (path.parent / "collector.lock").open("a") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        import moomoo as sdk
+
+        while True:
+            ctx = None
+            lock = threading.Lock()
+            securities, rights, identities = {}, {}, {}
+            session_id = uuid4().hex
+
+            def stamp():
+                return datetime.now(timezone.utc).isoformat()
+
+            try:
+                ctx = sdk.OpenQuoteContext(host="127.0.0.1", port=11111)
+                for handler in make_handlers(sdk, lock, securities, rights, stamp):
+                    ctx.set_handler(handler)
+                # Requests ONLY quote permissions; never BASIC, WEBKEY, or trade/account APIs.
+                ret, info = ctx.get_user_info([sdk.UserInfoField.QOTRIGHT])
+                if ret == sdk.RET_OK:
+                    rights.update({k: info.get(k) for k in ("us_qot_right", "us_option_qot_right")})
+                ret, basic = ctx.get_stock_basicinfo(
+                    sdk.Market.US,
+                    sdk.SecurityType.DRVT,
+                    [c for c in codes if any(ch.isdigit() for ch in c)],
+                )
+                if ret == sdk.RET_OK:
+                    identities.update(
+                        {row["code"]: row for row in json.loads(basic.to_json(orient="records"))}
+                    )
+                for code in codes:
+                    ret, msg = ctx.subscribe(
+                        [code],
+                        [sdk.SubType.QUOTE, sdk.SubType.ORDER_BOOK],
+                        is_first_push=False,
+                        subscribe_push=True,
+                    )
+                    if ret != sdk.RET_OK:
+                        securities[code] = {"error": "Subscription failed"}
+                    ret, rows = ctx.get_stock_quote([code])
+                    if ret == sdk.RET_OK:
+                        with lock:
+                            securities.setdefault(code, {})["quote"] = json.loads(
+                                rows.to_json(orient="records")
+                            )
+                    ret, book = ctx.get_order_book(code, num=1)
+                    if ret == sdk.RET_OK:
+                        with lock:
+                            securities.setdefault(code, {})["order_book"] = book
+                last_archive = 0
+                while True:
+                    ret, state = ctx.get_global_state()
+                    if ret != sdk.RET_OK or not state.get("qot_logined"):
+                        raise ValueError("Quote server disconnected")
+                    with lock:
+                        result = {
+                            "provider": "moomoo",
+                            "purpose": "market_data_only",
+                            "execution_enabled": False,
+                            "session_id": session_id,
+                            "received_at": stamp(),
+                            "rights": dict(rights),
+                            "identities": identities,
+                            "securities": securities,
+                            "quote_server_connected": True,
+                        }
+                        encoded = json.dumps(result, default=str) + "\n"
+                    temporary = path.with_suffix(".tmp")
+                    temporary.write_text(encoded)
+                    temporary.replace(path)
+                    if time.monotonic() - last_archive >= 5:
+                        with (path.parent / "raw.jsonl").open("a") as archive:
+                            archive.write(encoded)
+                        last_archive = time.monotonic()
+                    time.sleep(1)
+            except Exception as exc:
+                print("Quote-only collector retry:", type(exc).__name__, flush=True)
+                time.sleep(10)
+            finally:
+                if ctx is not None:
+                    ctx.close()
+
+
+if __name__ == "__main__":
+    main()
