@@ -5,12 +5,14 @@ from hedge.config import NY
 from hedge.demo import demo_manifest
 from hedge.models import utcnow
 from hedge.moomoo_data import MoomooData, code_for
+from hedge.valuation import ValuationEngine
 
 
 def fixture(manifest, now):
     at = (now - timedelta(minutes=20)).astimezone(NY)
     securities = {}
     for c in manifest.contracts:
+        price = ValuationEngine(manifest).price(c, 195, 0.3, now) if c.kind == "OPT" else 195
         securities[code_for(c)] = {
             "quote": [
                 {
@@ -23,7 +25,7 @@ def fixture(manifest, now):
                     "implied_volatility": 30,
                 }
             ],
-            "order_book": {"Bid": [[1, 10]], "Ask": [[2, 10]]},
+            "order_book": {"Bid": [[price - 0.01, 10]], "Ask": [[price + 0.01, 10]]},
         }
     return {
         "purpose": "market_data_only",
@@ -117,7 +119,59 @@ def test_fresh_option_cannot_use_stale_underlying_for_greeks(tmp_path):
                 "strike_price": c.strike,
             }
     stale = now - timedelta(seconds=6)
-    raw["securities"]["US.BA"]["quote"][0]["data_time"] = stale.time().isoformat()
+    raw["securities"]["US.BA"]["book_push_at"] = stale.isoformat()
     path = tmp_path / "quotes.json"
     path.write_text(json.dumps(raw))
     assert all(q.data_type == "frozen" for q in MoomooData(m, path).quotes(now).values())
+
+
+def test_fresh_book_with_old_last_trade_uses_calibrated_iv(tmp_path):
+    from datetime import datetime
+
+    m = demo_manifest()
+    now = datetime.combine(m.scoring_sessions[0], datetime.min.time(), NY).replace(hour=10)
+    raw = fixture(m, now)
+    raw.update(
+        quote_server_connected=True,
+        rights={"us_qot_right": "LV3", "us_option_qot_right": "LV1"},
+        identities={},
+    )
+    for c in m.contracts:
+        item = raw["securities"][code_for(c)]
+        item.update(book_push_at=now.isoformat(), book_push_count=2)
+        if c.kind == "OPT":
+            item["quote"][0]["implied_volatility"] = 90
+            raw["identities"][code_for(c)] = {
+                "stock_owner": "US.BA",
+                "strike_time": str(c.expiry),
+                "option_type": "CALL" if c.right == "C" else "PUT",
+                "strike_price": c.strike,
+            }
+    path = tmp_path / "quotes.json"
+    path.write_text(json.dumps(raw))
+    feed = MoomooData(m, path)
+    quotes = feed.quotes(now)
+    assert all(q.data_type == "live" for q in quotes.values())
+    assert quotes[101].observed_at == now
+    assert abs(quotes[101].iv - 0.3) < 0.001
+    assert abs(quotes[101].model_price - quotes[101].mid) < 0.0001
+    # A still-running collector/cache cannot turn an old book into a new quote.
+    assert all(q.data_type == "frozen" for q in feed.quotes(now + timedelta(seconds=6)).values())
+    raw["securities"][code_for(m.contract_map[101])]["order_book"] = {
+        "Bid": [[0.00001, 10]],
+        "Ask": [[0.00002, 10]],
+    }
+    path.write_text(json.dumps(raw))
+    assert MoomooData(m, path).quotes(now)[101].data_type == "frozen"
+
+
+def test_old_source_book_time_is_not_hidden_by_new_callback(tmp_path):
+    from datetime import datetime
+
+    m = demo_manifest()
+    now = datetime.combine(m.scoring_sessions[0], datetime.min.time(), NY).replace(hour=10)
+    item = fixture(m, now)["securities"]["US.BA"]
+    item.update(book_push_at=now.isoformat(), book_push_count=2)
+    source = now - timedelta(minutes=15)
+    item["order_book"]["svr_recv_time_bid"] = source.isoformat()
+    assert MoomooData.book_time(item) == source

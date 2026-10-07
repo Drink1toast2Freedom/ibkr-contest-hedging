@@ -77,6 +77,25 @@ class ValuationEngine:
             finally:
                 ql.Settings.instance().evaluationDate = original
 
+    def implied_volatility(self, c, spot, market_price, at):
+        """Bounded deterministic inversion of the same American pricing model."""
+        if not math.isfinite(market_price) or market_price <= 0:
+            raise ValueError("Positive finite midpoint required")
+        lo, hi = 0.001, 5.0
+        low_price, high_price = self.price(c, spot, lo, at), self.price(c, spot, hi, at)
+        if market_price <= low_price + 0.0001 or market_price >= high_price:
+            raise ValueError("Midpoint outside identifiable model IV bounds")
+        for _ in range(45):
+            mid = (lo + hi) / 2
+            price = self.price(c, spot, mid, at)
+            if abs(price - market_price) < 0.0001:
+                return mid
+            if price < market_price:
+                lo = mid
+            else:
+                hi = mid
+        raise ValueError("Midpoint IV calibration did not converge")
+
     def greeks(self, c, spot, iv, at):
         base = self.price(c, spot, iv, at)
         ds = max(0.01, spot * 0.001)

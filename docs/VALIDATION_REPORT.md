@@ -81,3 +81,24 @@ Local detailed results are in `reports/validation/`: JUnit XML, synthetic
 end-to-end checks, restart checks, read-only IBKR checks, exact adapter margin
 preview, and the synthetic Google live-request check. These reports, local
 account configurations, credentials and data archives are ignored by Git.
+
+## Intraday correction — quote timestamps
+
+The market-hours check revealed that `data_time` describes the latest price
+update, while bid/ask callbacks continued arriving for the same option. The
+adapter now dates executable quotes from actual book callbacks (and conservative
+server timestamps when supplied), independently of last-price timestamps.
+Collector heartbeats do not refresh quotes, and cached reads are reevaluated
+against the current clock. Underlying valuation uses a fresh book midpoint.
+
+Live option IV is a model estimate calibrated to the current midpoint with the
+same American-option/dividend model; Greeks are derived from that calibration.
+The bounded solve rejects unidentifiable or inconsistent prices. Old vendor IV
+is never promoted to freshly observed IV. Permission, contract-identity, stream
+confirmation, book-age and risk limits remain enforced.
+
+The complete updated suite passed **106 tests with no failures or skips**,
+including an isolated PostgreSQL database. A read-only collector sample showed
+all 15 instruments eligible, including both mandatory options, before deployment.
+After restart, streams must accumulate fresh callbacks again. The application
+remains paused; these checks do not authorize or submit additional orders.
