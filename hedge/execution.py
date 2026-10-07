@@ -29,6 +29,41 @@ class ExecutionManager:
             if r["state"] in ("SUBMITTING", "UNKNOWN")
         ]
 
+    def feasible_slices(self, target, snapshot, quotes, scenarios, now, setup=False):
+        """Read-only execution-path check, shared by activation and submission."""
+        actual = snapshot.quantities()
+        candidates = []
+        for i in sorted(set(target.quantities) | set(actual)):
+            difference = target.quantities.get(i, 0) - actual.get(i, 0)
+            if not difference:
+                continue
+            c, q = self.manifest.contract_map[i], quotes[i]
+            size = min(
+                abs(difference),
+                1 if c.kind == "OPT" else 100,
+                q.ask_size if difference > 0 else q.bid_size,
+            )
+            if size <= 0:
+                continue
+            signed = size if difference > 0 else -size
+            partial = dict(actual)
+            partial[i] = partial.get(i, 0) + signed
+            costs = execution_cost(self.manifest, quotes, [i], [signed])
+            current_risk = self.gate.engine.evaluate(snapshot, quotes, scenarios, actual)
+            result = self.gate.validate(
+                snapshot,
+                quotes,
+                scenarios,
+                partial,
+                now,
+                costs=2 * costs,
+                corrective=not current_risk.passed,
+                day_zero=setup,
+            )
+            if result.passed:
+                candidates.append((result.metrics.get("stress_loss", float("inf")), i, signed, result))
+        return candidates
+
     async def submit_slice(self, target, decision_id, snapshot, quotes, scenarios, now, setup=False):
         async with self.lock:
             if self.paused or self.pause_requested or self.unresolved():
@@ -45,44 +80,15 @@ class ExecutionManager:
                 }
             if self.store.intents(snapshot.account, True) or snapshot.orders:
                 return {"submitted": False, "reason": "Working orders must reconcile before a new slice"}
+            candidates = self.feasible_slices(target, snapshot, quotes, scenarios, now, setup)
             actual = snapshot.quantities()
-            candidates = []
-            for i in sorted(set(target.quantities) | set(actual)):
-                difference = target.quantities.get(i, 0) - actual.get(i, 0)
-                if not difference:
-                    continue
-                c, q = self.manifest.contract_map[i], quotes[i]
-                size = min(
-                    abs(difference),
-                    1 if c.kind == "OPT" else 100,
-                    q.ask_size if difference > 0 else q.bid_size,
-                )
-                if size <= 0:
-                    continue
-                signed = size if difference > 0 else -size
-                partial = dict(actual)
-                partial[i] = partial.get(i, 0) + signed
-                costs = execution_cost(self.manifest, quotes, [i], [signed])
-                current_risk = self.gate.engine.evaluate(snapshot, quotes, scenarios, actual)
-                result = self.gate.validate(
-                    snapshot,
-                    quotes,
-                    scenarios,
-                    partial,
-                    now,
-                    costs=2 * costs,
-                    corrective=not current_risk.passed,
-                    day_zero=setup,
-                )
-                if result.passed:
-                    candidates.append((result.metrics.get("stress_loss", float("inf")), i, signed, result))
             if not candidates:
                 return {"submitted": False, "reason": "No intermediate execution slice passes risk checks"}
             _, identifier, signed, result = min(candidates, key=lambda x: (x[0], x[1]))
             partial = dict(actual)
             partial[identifier] = partial.get(identifier, 0) + signed
             costs = execution_cost(self.manifest, quotes, [identifier], [signed])
-            c, q = self.manifest.contract_map[identifier], quotes[identifier]
+            q = quotes[identifier]
             # Midpoint never exceeds executable quote; options round to a safe
             # cent pending broker-specific minimum-tick qualification below.
             tick = Decimal("0.01")
@@ -144,7 +150,9 @@ class ExecutionManager:
                         partial,
                         fresh_now,
                         costs=2 * costs,
-                        corrective=not current_risk.passed,
+                        corrective=not self.gate.engine.evaluate(
+                            fresh_snapshot, fresh_quotes, fresh_scenarios, actual
+                        ).passed,
                         day_zero=setup,
                     )
                     if not refreshed.passed:

@@ -214,16 +214,8 @@ async def test_paper_activation_can_correct_existing_delta_breach(store, manifes
     service.last_quotes = service.broker.quotes()
     service.last_scenarios = ScenarioEngine(manifest).build(snapshot, service.last_quotes, now)
     service.ledger.import_close(manifest.day_zero, manifest.initial_nav, "fixture", manifest.account)
-    service.last_target = Target(
-        quantities=manifest.mandatory,
-        expected_score=1,
-        current_score=200,
-        uncertainty=0,
-        status="OPTIMAL",
-        snapshot_id=snapshot.version,
-        scenario_id=service.last_scenarios.identifier,
-        config_hash=manifest.config_hash,
-    )
+    service.now = lambda: now
+    assert service.last_target is None
 
     async def reconcile():
         return snapshot
@@ -232,6 +224,37 @@ async def test_paper_activation_can_correct_existing_delta_breach(store, manifes
     result = await service.control("paper")
     assert result["mode"] == "PAPER"
     assert not service.execution.paused
+    assert service.last_target.status == "OPTIMAL"
+    assert service.pending_target is service.last_target
+    assert store.records("decision", manifest.account)
+    assert not service.broker.orders  # Activation itself never transmits.
+    candidates = service.execution.feasible_slices(
+        service.last_target, snapshot, service.last_quotes, service.last_scenarios, now
+    )
+    assert candidates
+    initial_delta = abs(
+        service.gate.engine.evaluate(
+            snapshot, service.last_quotes, service.last_scenarios, snapshot.quantities()
+        ).metrics["delta:BA"]
+    )
+    # Every offered corrective slice reduces the breached metric without a new breach.
+    assert all(abs(c[3].metrics["delta:BA"]) < initial_delta for c in candidates)
+    submitted = await service.execution.submit_slice(
+        service.pending_target,
+        service.last_decision_id,
+        snapshot,
+        service.last_quotes,
+        service.last_scenarios,
+        now,
+    )
+    assert submitted["submitted"]
+    await service.broker.fill(submitted["order_id"])
+    after = service.broker.snapshot()
+    after_risk = service.gate.engine.evaluate(
+        after, service.last_quotes, service.last_scenarios, after.quantities()
+    )
+    assert abs(after_risk.metrics["delta:BA"]) < initial_delta
+    assert service.gate.registry.check(after.quantities()) == []
 
 
 def test_ai_cannot_invent_trades_or_limits():
@@ -338,3 +361,46 @@ async def test_margin_preview_uses_same_explicit_tif_as_execution(manifest, snap
     broker.ib = PreviewOnly()
     result = await broker.margin_preview(request(manifest, snapshot))
     assert result.initMarginChange == "100"
+
+
+async def test_corrective_activation_rejects_stale_quotes(store, manifest, quotes, now):
+    from datetime import timedelta
+
+    service = TradingService(manifest, store, demo=True)
+    service.now = lambda: now
+    await service.broker.connect()
+    service.broker.update_quotes(
+        {
+            i: q.model_copy(update={"data_type": "synthetic", "observed_at": now - timedelta(minutes=2)})
+            for i, q in quotes.items()
+        },
+        now,
+    )
+    service.broker.positions[10] = 1000
+    service.last_snapshot = service.broker.snapshot()
+    service.last_quotes = service.broker.quotes()
+    service.last_scenarios = ScenarioEngine(manifest).build(service.last_snapshot, service.last_quotes, now)
+    service.ledger.import_close(manifest.day_zero, manifest.initial_nav, "fixture", manifest.account)
+    with pytest.raises(ValueError, match="Corrective hedge unavailable"):
+        await service.control("paper")
+    assert service.mode == "PAUSED" and service.execution.paused
+    assert not service.broker.orders
+
+
+async def test_corrective_activation_requires_feasible_first_slice(store, manifest, quotes, now, monkeypatch):
+    service = TradingService(manifest, store, demo=True)
+    service.now = lambda: now
+    await service.broker.connect()
+    service.broker.update_quotes(
+        {i: q.model_copy(update={"data_type": "synthetic"}) for i, q in quotes.items()}, now
+    )
+    service.broker.positions[10] = 1000
+    service.last_snapshot = service.broker.snapshot()
+    service.last_quotes = service.broker.quotes()
+    service.last_scenarios = ScenarioEngine(manifest).build(service.last_snapshot, service.last_quotes, now)
+    service.ledger.import_close(manifest.day_zero, manifest.initial_nav, "fixture", manifest.account)
+    monkeypatch.setattr(service.execution, "feasible_slices", lambda *args: [])
+    with pytest.raises(ValueError, match="first slice"):
+        await service.control("paper")
+    assert service.mode == "PAUSED" and service.execution.paused
+    assert not service.broker.orders

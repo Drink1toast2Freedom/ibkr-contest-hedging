@@ -102,3 +102,26 @@ including an isolated PostgreSQL database. A read-only collector sample showed
 all 15 instruments eligible, including both mandatory options, before deployment.
 After restart, streams must accumulate fresh callbacks again. The application
 remains paused; these checks do not authorize or submit additional orders.
+
+## Corrective activation and operator delta limit
+
+The paper-enable control now generates a fresh proposal when the existing
+portfolio breaches a risk limit and paused mode has no proposal. It requires
+a fully compliant target and at least one independently validated first
+execution slice before activating. Each subsequent slice is still gated; an
+intermediate breach is permitted only when it improves an existing breach,
+does not worsen another breach, and creates no new violation. No stale target
+is reused as authorization. Mandatory quantities remain exact.
+
+The operator selected a **20% residual dollar-delta cap** for the local practice
+configuration, replacing 10%. The normal configuration default remains 10%;
+20% is the maximum accepted configuration value. The 3% stress-loss cap and
+all other limits remain unchanged. This limit controls sensitivity to the
+underlying, not a maximum possible loss.
+
+Regression checks cover activation without a prior target, an actual simulated
+risk-reducing fill, stale-data rejection, an unavailable execution path, and
+validation of the operator limit.
+
+The final full regression run passed **109 tests with zero failures or skips**,
+including the isolated PostgreSQL integration test.

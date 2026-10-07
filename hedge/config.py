@@ -21,7 +21,7 @@ class RiskLimits(Frozen):
     liquidity_buffer: float = Field(default=0.25, ge=0.25, lt=1)
     gross_notional: float = Field(default=3, gt=0, le=3)
     stock_notional: float = Field(default=0.5, gt=0, le=0.5)
-    residual_delta: float = Field(default=0.1, gt=0, le=0.1)
+    residual_delta: float = Field(default=0.1, gt=0, le=0.2)
     contracts_per_option: int = Field(default=50, gt=0, le=50)
     option_names: int = Field(default=6, gt=0, le=6)
     stock_quote_age: int = Field(default=5, gt=0)

@@ -712,6 +712,14 @@ class TradingService:
                         self.now(),
                     )
                     if not result.passed:
+                        # PAUSED has no proposal loop. Build a fresh, auditable
+                        # target here instead of requiring a pre-existing target
+                        # that paused operation can never produce.
+                        self.last_target = None
+                        self.force_optimize = True
+                        self.last_snapshot = self.broker.snapshot()
+                        self.last_quotes = self.broker.quotes()
+                        await self.optimize()
                         correction = None
                         if self.last_target and self.last_target.status == "OPTIMAL":
                             correction = self.gate.validate(
@@ -723,7 +731,20 @@ class TradingService:
                                 2 * self.last_target.estimated_cost,
                             )
                         if correction is None or not correction.passed:
-                            raise ValueError("; ".join(result.reasons))
+                            raise ValueError(
+                                "Corrective hedge unavailable: "
+                                + "; ".join(correction.reasons if correction else result.reasons)
+                            )
+                        # A fully compliant target is insufficient unless its
+                        # first intermediate slice can actually reduce risk.
+                        if not self.execution.feasible_slices(
+                            self.last_target,
+                            self.broker.snapshot(),
+                            self.broker.quotes(),
+                            self.last_scenarios,
+                            self.now(),
+                        ):
+                            raise ValueError("Corrective hedge has no permitted risk-reducing first slice")
                     day = self.manifest.active_session(self.now())
                     if day != self.manifest.day_zero and self.ledger.previous_close(day) is None:
                         raise ValueError("Official previous closing NAV required")
@@ -767,6 +788,10 @@ class TradingService:
                 self.execution.paused = self.execution.pause_requested = False
                 self.setup_armed = False
                 self.mode, self.force_optimize = ("PAPER" if action == "paper" else "SETUP"), True
+                if action == "paper" and not result.passed:
+                    self.pending_target = self.last_target
+                    self.active_plan_started = False
+                    self.health = "Paper enabled: executing independently validated corrective hedge"
             elif action == "reconcile":
                 await self.reconcile()
                 if not self.demo and self.market_data_errors:

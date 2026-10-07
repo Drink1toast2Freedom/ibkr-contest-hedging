@@ -206,3 +206,14 @@ def test_authorized_forecast_does_not_fabricate_official_rate(store, manifest):
     assert ledger.target_for(day) is None
     assert ledger.target_for(day, allow_estimate=True) == Decimal("1000100")
     assert ledger.summary()["days"][0]["score"] is None
+
+
+def test_operator_can_configure_twenty_percent_delta_cap(manifest):
+    from pydantic import ValidationError
+
+    from hedge.config import RiskLimits
+
+    assert RiskLimits(residual_delta=0.2).residual_delta == 0.2
+    assert RiskLimits().residual_delta == 0.1
+    with pytest.raises(ValidationError):
+        RiskLimits(residual_delta=0.21)
