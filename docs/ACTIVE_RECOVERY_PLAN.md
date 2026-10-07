@@ -82,6 +82,23 @@ https://syndication.finra.org/content/lowdown-leveraged-and-inverse-exchange-tra
 
 ## 3. First version to build
 
+Related-security extension researched October 7, 2026:
+[RELATED_SECURITIES_RESEARCH.md](RELATED_SECURITIES_RESEARCH.md) screens 24
+symbols using 20/60/120 completed daily-return windows and primary-source business
+and event information. Next research priorities are UAL and GE, plus XLE as a
+conditional energy candidate. DAL/JETS, XAR and CVX are alternatives, not an
+instruction to accumulate every related name. DAL's October 9 earnings event
+requires special treatment in this practice. No ordinary stock screened provides
+a strong, stable natural inverse BA relationship. SH remains an unapproved
+inverse-market research benchmark requiring separate reset validation.
+
+These candidates extend the hedge research pool, not the active execution
+allowlist or SPY/QQQ recovery forecasts. Compare repriced combined option P&L and
+official score after costs, validate intraday relationships and forecasts, then
+use existing shadow/promotion gates. Correlation with BA shares alone is not
+evidence of reduced straddle risk or expected deficit recovery. Retain the current
+12-underlying cap and benchmark latency before enlarging an active universe.
+
 Start with SPY and QQQ shares. Add XLI and ITA only after liquidity and signal
 validation. Keep all currently held contracts in the combined risk calculation.
 Use the existing qualified stock/ETF universe; other asset categories require
