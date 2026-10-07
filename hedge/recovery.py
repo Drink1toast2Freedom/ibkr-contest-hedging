@@ -334,6 +334,8 @@ def rebase_forecasts(forecasts, quotes, manifest):
             continue
         current = quotes[stock.con_id].spot
         bar = forecast["bar_price"]
+        if abs(current / bar - 1) > 0.02:
+            raise ValueError("Recovery bar/live-price discontinuity: verify split, adjustment, or feed")
         forecast["bar_mean_return"] = forecast["mean_return"]
         forecast["mean_return"] = bar * (1 + forecast["mean_return"]) / current - 1
         forecast["parameter_se"] *= bar / current

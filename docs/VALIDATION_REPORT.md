@@ -194,10 +194,11 @@ attribution and persistent daily loss baselines; quote-replay integration; and
 CSRF-protected off/shadow/paper controls. First-release advanced-strategy scope and
 missing evidence are documented in RECOVERY_RUNBOOK.md.
 
-The final complete suite passed **128 tests with zero failures or skips**,
-including isolated PostgreSQL. Ten recovery tests cover future exclusion,
+The final complete suite passed **129 tests with zero failures or skips**,
+including isolated PostgreSQL. Eleven recovery tests cover future exclusion,
 integrity, stale/sparse bars, promotion rejection, budgets, mandatory quantities,
-execution-slice limits, P&L baselines, shadow isolation and price rebasing.
+execution-slice limits, P&L baselines, shadow isolation, price rebasing and
+bar/quote discontinuity rejection. Ruff and whitespace checks passed.
 
 Moomoo supplied **97,113 minute observations** for SPY/QQQ. Chronological research
 used 13 fixed-model folds and 64 complete held-out sessions per strategy. Forecast
@@ -213,3 +214,10 @@ fresh book, while a book with both source sides old remains old. Freshness caps
 are unchanged. Approval changes cancel an active recovery plan before further
 submissions. Live shadow produces four forecasts and independently checked
 candidates; bar-based evidence is rejected for paper recovery.
+
+Operational status at final verification: ordinary paper trading is paused.
+Both the application and an independent read-only IBKR client received account,
+position and execution synchronization timeouts despite the reachable TWS socket.
+No fresh reconciliation or new recovery execution is claimed. Restoring the
+authenticated Paper TWS session and passing reconciliation are required before
+ordinary paper activation. Recovery remains shadow pending empirical promotion.

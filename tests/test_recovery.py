@@ -349,16 +349,42 @@ def test_forecast_rebases_to_current_price_instead_of_chasing_finished_move(mani
     )
     qs = {
         **quotes,
-        200: quotes[10].model_copy(update={"con_id": 200, "spot": 105, "bid": 104.99, "ask": 105.01}),
+        200: quotes[10].model_copy(update={"con_id": 200, "spot": 101, "bid": 100.99, "ask": 101.01}),
     }
     forecast = {
         "symbol": "SPY",
         "bar_price": 100,
-        "mean_return": 0.02,
+        "mean_return": 0.005,
         "parameter_se": 0.001,
         "residual_sd": 0.005,
     }
     updated = rebase_forecasts([forecast], qs, m)[0]
-    assert updated["mean_return"] == pytest.approx(102 / 105 - 1)
+    assert updated["mean_return"] == pytest.approx(100.5 / 101 - 1)
     assert updated["conservative_return"] < 0  # price has already exceeded the forecast
-    assert forecast["mean_return"] == 0.02  # immutable source interpretation
+    assert forecast["mean_return"] == 0.005  # immutable source interpretation
+
+
+def test_bar_quote_discontinuity_cannot_create_a_recovery_forecast(manifest, quotes):
+    from hedge.recovery import rebase_forecasts
+
+    m = manifest.model_copy(
+        update={"contracts": (*manifest.contracts, Contract(con_id=200, symbol="SPY", kind="STK"))}
+    )
+    qs = {
+        **quotes,
+        200: quotes[10].model_copy(update={"con_id": 200, "spot": 50, "bid": 49.99, "ask": 50.01}),
+    }
+    with pytest.raises(ValueError, match="discontinuity"):
+        rebase_forecasts(
+            [
+                {
+                    "symbol": "SPY",
+                    "bar_price": 100,
+                    "mean_return": 0.002,
+                    "parameter_se": 0.001,
+                    "residual_sd": 0.002,
+                }
+            ],
+            qs,
+            m,
+        )

@@ -99,6 +99,17 @@ model corruption, or a loss/budget breach prevents new recovery exposure. The
 fallback is the validated hedge controller. All global limits, exact mandatory
 quantities, account identity and IBKR source-of-truth rules continue to apply.
 
+A difference greater than 2% between a forecast's completed-bar price and the
+current quote blocks that forecast until a split, adjustment, feed mismatch, or
+large intervening move is reviewed. Rebasing never turns an inconsistent price
+series into an apparent recovery opportunity.
+
+On October 7 the deployed service paused ordinary paper trading because TWS
+accepted its socket connection but timed out on positions, account values, and
+executions. An independent read-only client reproduced the failure. A reachable
+port alone is insufficient: restore the authenticated Paper TWS session, then
+reconcile broker state before enabling paper trading. Recovery remains shadow.
+
 Pairs, directional option spreads, volatility-relative-value recovery and new
 long-option gamma scalping are later research stages in ACTIVE_RECOVERY_PLAN.md;
 they are not activated by this first release. The existing BA option/stock hedge
