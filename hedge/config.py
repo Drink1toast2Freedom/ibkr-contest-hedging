@@ -79,6 +79,7 @@ class Manifest(Frozen):
     scoring_forecast_source: str = ""
     market_data_provider: Literal["ibkr", "moomoo"] = "ibkr"
     daily_stock_history: str | None = None
+    recovery: dict = Field(default_factory=dict)
     initial_nav: Decimal = Field(default=Decimal("1000000"), gt=0)
     contracts: tuple[Contract, ...]
     mandatory: dict[int, int]
@@ -98,6 +99,10 @@ class Manifest(Frozen):
 
     @model_validator(mode="after")
     def validate_contest(self):
+        if self.recovery:
+            from .recovery import RecoveryConfig
+
+            RecoveryConfig.model_validate(self.recovery)
         if any(
             day not in self.scoring_sessions or not rate.is_finite() or not Decimal(0) <= rate <= Decimal(1)
             for day, rate in self.scoring_daily_rates.items()

@@ -60,6 +60,11 @@ def main():
     )
     research.add_argument("--spread-multiplier", type=float, default=1)
     research.add_argument("--output", default="reports/backtest.json")
+    research.add_argument(
+        "--recovery",
+        action="store_true",
+        help="Evaluate frozen recovery model in quote replay; never promotes automatically",
+    )
     sweep = commands.add_parser("walk-forward")
     sweep.add_argument("--config", required=True)
     sweep.add_argument("--quotes", required=True)
@@ -93,9 +98,43 @@ def main():
     expand.add_argument("--config", required=True)
     expand.add_argument("--symbols", nargs="+", required=True)
     expand.add_argument("--output", required=True)
+    rec_train = commands.add_parser("train-recovery", help="Freeze deterministic recovery forecasts")
+    rec_train.add_argument("--config", required=True)
+    rec_train.add_argument("--bars", required=True)
+    rec_train.add_argument("--before", required=True)
+    rec_train.add_argument("--output", default="data/recovery/model.json")
+    rec_research = commands.add_parser(
+        "validate-recovery", help="Chronological bar-based forecast research; no promotion"
+    )
+    rec_research.add_argument("--config", required=True)
+    rec_research.add_argument("--bars", required=True)
+    rec_research.add_argument("--train-sessions", type=int, choices=[20, 60, 120], default=60)
+    rec_research.add_argument("--test-sessions", type=int, default=5)
+    rec_research.add_argument("--output", default="reports/recovery/forecast-validation.json")
     args = parser.parse_args()
     try:
-        if args.command == "expand-universe":
+        if args.command in ("train-recovery", "validate-recovery"):
+            from datetime import datetime
+
+            from .recovery import RecoveryConfig, fit_models, normalize_bars
+            from .recovery_research import walk_forward_forecasts
+
+            m = load_manifest(args.config)
+            config = RecoveryConfig.model_validate(m.recovery)
+            bars = pd.read_parquet(args.bars) if args.bars.endswith(".parquet") else pd.read_csv(args.bars)
+            if args.command == "train-recovery":
+                before = datetime.fromisoformat(args.before)
+                if before.tzinfo is None:
+                    raise ValueError("Timezone-aware training cutoff required")
+                result = fit_models(bars, m, config, before)
+                Path(config.bars_path).parent.mkdir(parents=True, exist_ok=True)
+                normalize_bars(bars, before).drop(columns="day").to_parquet(config.bars_path, index=False)
+            else:
+                result = walk_forward_forecasts(bars, m, config, args.train_sessions, args.test_sessions)
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.output).write_text(json.dumps(result, indent=2))
+            print("Recovery artifact saved; bar validation does not authorize paper recovery")
+        elif args.command == "expand-universe":
             import yaml
 
             from .universe_discovery import qualify_stock_universe
@@ -163,7 +202,19 @@ def main():
                 variant = Variant(
                     args.strategy, args.stock_minutes, args.option_minutes, args.threshold, policy=args.policy
                 )
-                result = ReplayEngine(manifest, variant, args.spread_multiplier).run(frame)
+                recovery = None
+                if args.recovery:
+                    from .recovery import RecoveryController
+
+                    research_store = Store("sqlite://")
+                    research_store.initialize()
+                    recovery = RecoveryController(manifest, research_store)
+                    recovery.mode = "shadow"  # replay is never an execution activation
+                try:
+                    result = ReplayEngine(manifest, variant, args.spread_multiplier, recovery).run(frame)
+                finally:
+                    if recovery:
+                        recovery.store.close()
             else:
                 reference = {
                     item.split("=", 1)[0]: float(item.split("=", 1)[1]) for item in args.reference_spot

@@ -16,6 +16,7 @@ from .execution import ExecutionManager
 from .models import Target, digest, utcnow
 from .moomoo_data import MoomooData
 from .optimizer import HedgeOptimizer
+from .recovery import RecoveryController, recovery_budget_errors
 from .risk import RiskGate
 from .scenarios import ScenarioEngine
 from .scoring import ScoreLedger
@@ -81,6 +82,8 @@ class TradingService:
         self.setup_armed = False
         self.setup_target_quantities = None
         self.auto_hedge_after_setup = False
+        self.recovery = RecoveryController(manifest, store)
+        self.pending_recovery = None
         self.market_data_errors = {}
 
     def now(self):
@@ -281,6 +284,7 @@ class TradingService:
                 if baseline is not None:
                     self.gate.engine.baseline_nav = self.optimizer.baseline_nav = float(baseline)
                 self.last_quotes = self.broker.quotes()
+                self.recovery.observe_close(self.last_quotes, self.now())
                 if (
                     self.moomoo_data
                     and self.moomoo_data.path.exists()
@@ -460,6 +464,49 @@ class TradingService:
             if newest.quantities() != snap.quantities() or newest.orders != snap.orders:
                 self.force_optimize = True
                 return
+            ordinary_floor = max(
+                self.manifest.policy.score_threshold,
+                self.manifest.policy.uncertainty_multiplier * target.uncertainty,
+            )
+            recovery_baseline = target
+            if target.current_score - target.expected_score <= ordinary_floor:
+                recovery_baseline = self.optimizer.evaluate_target(
+                    snap,
+                    quotes,
+                    scenarios,
+                    target.model_copy(update={"quantities": snap.quantities()}),
+                    previous,
+                    estimate,
+                )
+            recovery_target, recovery_scenarios, recovery_record = await asyncio.to_thread(
+                self.recovery.evaluate,
+                self.optimizer,
+                snap,
+                quotes,
+                scenarios,
+                recovery_baseline,
+                previous,
+                estimate,
+                now,
+            )
+            self.store.record("recovery_shadow", snap.account, recovery_record)
+            newest = self.broker.snapshot()
+            if newest.quantities() != snap.quantities() or newest.orders != snap.orders:
+                self.force_optimize = True
+                return
+            recovery_selected = False
+            baseline_quantities = dict(recovery_baseline.quantities)
+            if (
+                self.recovery.mode == "paper"
+                and recovery_target is not None
+                and not self.recovery.paper_errors(recovery_record.get("model_hash"))
+            ):
+                if all(
+                    newest.quantities().get(i, 0) == baseline_quantities.get(i, 0)
+                    for i in set(newest.quantities()) | set(baseline_quantities)
+                ):
+                    target, scenarios = recovery_target, recovery_scenarios
+                    recovery_selected = True
             gate = self.gate.validate(
                 newest,
                 self.broker.quotes(),
@@ -468,6 +515,19 @@ class TradingService:
                 self.now(),
                 2 * target.estimated_cost,
             )
+            if recovery_selected:
+                extra = recovery_budget_errors(
+                    self.manifest,
+                    self.recovery.config,
+                    newest,
+                    self.broker.quotes(),
+                    scenarios,
+                    target.quantities,
+                    baseline_quantities,
+                    2 * target.estimated_cost,
+                )
+                if extra:
+                    gate = gate.model_copy(update={"passed": False, "reasons": (*gate.reasons, *extra)})
             improvement = target.current_score - target.expected_score
             threshold = max(
                 self.manifest.policy.score_threshold,
@@ -486,6 +546,8 @@ class TradingService:
                 and target.status == "OPTIMAL"
                 and (improvement > threshold or corrective),
                 "corrective": corrective,
+                "recovery": recovery_selected,
+                "recovery_reference": baseline_quantities if recovery_selected else None,
                 "nav_gap": estimate - float(previous),
                 "closing_target": float(previous),
                 "optimization_scope": "FULL" if full else "STOCK",
@@ -512,6 +574,16 @@ class TradingService:
             self.force_optimize = False
             if self.mode == "PAPER" and record["trade_eligible"]:
                 self.pending_target = target
+                self.pending_recovery = (
+                    {
+                        "reference": baseline_quantities,
+                        "scenarios": scenarios,
+                        "generated_at": now,
+                        "model_hash": recovery_record.get("model_hash"),
+                    }
+                    if recovery_selected
+                    else None
+                )
                 self.active_plan_started = False
             self.health = (
                 "Monitoring: proposal eligible"
@@ -524,6 +596,32 @@ class TradingService:
         snapshot = self.broker.snapshot()
         quotes = self.broker.quotes()
         actual = snapshot.quantities()
+        scenario_for_plan = self.last_scenarios
+        self.execution.recovery_checks = None
+        if self.pending_recovery is not None:
+            approval_errors = self.recovery.paper_errors(self.pending_recovery["model_hash"])
+            if approval_errors:
+                await self.execution.pause()
+                self.recovery.mode = "shadow"
+                self.mode = "SHADOW" if self.execution.pause_complete() else "PAUSED"
+                self.pending_target = self.pending_recovery = None
+                self.execution.recovery_checks = None
+                self.force_optimize = True
+                self.health = "Recovery approval invalidated; " + "; ".join(approval_errors)
+                return
+            if (
+                self.recovery.mode != "paper"
+                or (self.now() - self.pending_recovery["generated_at"]).total_seconds()
+                > self.recovery.config.max_signal_age
+            ):
+                self.pending_target = self.pending_recovery = None
+                self.force_optimize = True
+                return
+            scenario_for_plan = self.pending_recovery["scenarios"]
+            reference = dict(self.pending_recovery["reference"])
+            self.execution.recovery_checks = lambda snap, qs, sc, amounts, costs: (
+                self.recovery.execution_errors(snap, qs, sc, amounts, reference, costs, self.now())
+            )
         if snapshot.orders or self.store.intents(snapshot.account, True):
             return
         changed = [
@@ -533,7 +631,7 @@ class TradingService:
             self.pending_target = None
             self.active_plan_started = False
             return
-        corrective = not self.gate.engine.evaluate(snapshot, quotes, self.last_scenarios, actual).passed
+        corrective = not self.gate.engine.evaluate(snapshot, quotes, scenario_for_plan, actual).passed
         if not self.active_plan_started and not corrective:
             for i in changed:
                 kind = self.manifest.contract_map[i].kind
@@ -556,7 +654,7 @@ class TradingService:
             return
         estimate = self.nav_tracker.estimate(snapshot, quotes, self.manifest.contract_map)
         target = self.optimizer.evaluate_target(
-            snapshot, quotes, self.last_scenarios, target, previous, estimate
+            snapshot, quotes, scenario_for_plan, target, previous, estimate
         )
         threshold = max(
             self.manifest.policy.score_threshold,
@@ -567,13 +665,13 @@ class TradingService:
             self.active_plan_started = False
             return
         if not self.gate.validate(
-            snapshot, quotes, self.last_scenarios, target.quantities, self.now(), 2 * target.estimated_cost
+            snapshot, quotes, scenario_for_plan, target.quantities, self.now(), 2 * target.estimated_cost
         ).passed:
             self.pending_target = None
             self.force_optimize = True
             return
         result = await self.execution.submit_slice(
-            target, self.last_decision_id, snapshot, quotes, self.last_scenarios, self.now()
+            target, self.last_decision_id, snapshot, quotes, scenario_for_plan, self.now()
         )
         if result["submitted"]:
             # Cooldown begins for a plan, not every slice, to allow completion.
@@ -678,9 +776,12 @@ class TradingService:
                 self.setup_armed = self.auto_hedge_after_setup = False
                 self.store.record("setup_schedule", self.manifest.account, {"status": "CANCELLED"})
                 self.mode = "PAUSED"
-                self.pending_target = None
+                self.pending_target = self.pending_recovery = None
+                self.execution.recovery_checks = None
                 await self.execution.pause()
             elif action == "shadow":
+                self.pending_target = self.pending_recovery = None
+                self.execution.recovery_checks = None
                 self.setup_target_quantities = None
                 self.setup_armed = self.auto_hedge_after_setup = False
                 await self.execution.pause()
@@ -937,6 +1038,7 @@ class TradingService:
                 "ai": self.store.records("supervisor", self.manifest.account, 1),
                 "ai_enabled": self.supervisor.enabled,
                 "ai_status": self.supervisor.status(),
+                "recovery": self.recovery.latest,
                 "profile": self.profile,
                 "profiles": list(PROFILES if self.demo else self.supervisor.allowed_profiles),
                 "pause_pending": self.execution.pause_requested and not self.execution.pause_complete(),

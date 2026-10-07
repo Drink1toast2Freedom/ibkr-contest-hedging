@@ -184,3 +184,32 @@ concurrency regression confirms only one IBKR download is in flight.
 
 After the reconciliation fix, the complete suite passed **117 tests with zero
 failures or skips**, including isolated PostgreSQL.
+
+## Forecast recovery first release
+
+Implemented SPY/QQQ momentum and reversal, model integrity/cutoff checks, clustered
+parameter uncertainty, current-price rebasing and matched-clock volatility floors;
+bounded combined optimization; independent per-slice budgets; corrected-fill P&L
+attribution and persistent daily loss baselines; quote-replay integration; and
+CSRF-protected off/shadow/paper controls. First-release advanced-strategy scope and
+missing evidence are documented in RECOVERY_RUNBOOK.md.
+
+The final complete suite passed **128 tests with zero failures or skips**,
+including isolated PostgreSQL. Ten recovery tests cover future exclusion,
+integrity, stale/sparse bars, promotion rejection, budgets, mandatory quantities,
+execution-slice limits, P&L baselines, shadow isolation and price rebasing.
+
+Moomoo supplied **97,113 minute observations** for SPY/QQQ. Chronological research
+used 13 fixed-model folds and 64 complete held-out sessions per strategy. Forecast
+RMSE improved slightly relative to zero-mean forecasts, before trading costs;
+this is not empirical recovery profit or total-contest performance. Bar timestamp
+semantics and venue volume require verification. The profile is deployed as
+**shadow recovery** and rejects bar-only evidence for paper activation.
+
+The final live-feed correction dates complete books by the latest reported
+bid/ask-side update bounded by actual callback arrival, rather than requiring
+both sides to change. Regression confirms one unchanged side cannot stale a
+fresh book, while a book with both source sides old remains old. Freshness caps
+are unchanged. Approval changes cancel an active recovery plan before further
+submissions. Live shadow produces four forecasts and independently checked
+candidates; bar-based evidence is rejected for paper recovery.

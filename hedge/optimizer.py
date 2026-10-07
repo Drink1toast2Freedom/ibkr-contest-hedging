@@ -86,7 +86,18 @@ class HedgeOptimizer:
         )
 
     def solve(
-        self, snapshot, quotes, scenarios, previous_nav, nav_estimate=None, stock_only=False, strategy=None
+        self,
+        snapshot,
+        quotes,
+        scenarios,
+        previous_nav,
+        nav_estimate=None,
+        stock_only=False,
+        strategy=None,
+        recovery_reference=None,
+        recovery_symbols=(),
+        recovery_stress=0.0025,
+        recovery_gross=0.05,
     ):
         m = self.manifest
         strategy = strategy or m.strategy
@@ -254,6 +265,44 @@ class HedgeOptimizer:
         if strategy == "two_close" and scenarios.next_changes is not None:
             objective_score += scenarios.weights @ cp.abs(scenarios.next_changes @ total_h)
         constraints += [scenarios.stress @ total_h - 2 * costs >= -m.risk.stress_loss * budget]
+        if recovery_reference is not None:
+            if not 0 < recovery_stress <= 0.0025 or not 0 < recovery_gross <= 0.05:
+                raise ValueError("Recovery budget cannot exceed validated bounds")
+            ref = np.array([recovery_reference.get(i, 0) for i in ids])
+            recovery_j = [
+                j
+                for j, i in enumerate(candidates)
+                if m.contract_map[i].kind == "STK" and m.contract_map[i].symbol in recovery_symbols
+            ]
+            for j, i in enumerate(ids):
+                if m.contract_map[i].kind != "STK" or m.contract_map[i].symbol not in recovery_symbols:
+                    constraints.append(total_h[j] == ref[j])
+            recovery_costs = (
+                (
+                    np.array(spread_cost)[recovery_j] @ (buy[recovery_j] + sell[recovery_j])
+                    + np.array(fees_buy)[recovery_j] @ buy_count[recovery_j]
+                    + np.array(fees_sell)[recovery_j] @ sell_count[recovery_j]
+                )
+                if recovery_j
+                else 0
+            )
+            constraints += [
+                scenarios.stress @ (total_h - ref) - 2 * recovery_costs >= -recovery_stress * budget
+            ]
+            constraints += [
+                cp.sum(
+                    cp.hstack(
+                        [
+                            quotes[i].spot * cp.abs(total_h[j] - ref[j])
+                            for j, i in enumerate(ids)
+                            if m.contract_map[i].kind == "STK"
+                            and m.contract_map[i].symbol in recovery_symbols
+                        ]
+                    )
+                )
+                <= recovery_gross * budget
+            ]
+
         spots = np.array([quotes[i].spot * m.contract_map[i].multiplier for i in ids])
         constraints += [spots @ absolute_h <= m.risk.gross_notional * budget]
         increment = cp.Variable(n, nonneg=True)

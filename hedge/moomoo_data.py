@@ -37,13 +37,16 @@ class MoomooData:
             raise ValueError("Invalid two-sided book")
         # Source timestamps are not guaranteed for US instruments. When supplied,
         # retain their conservative age as additional evidence, never overwrite it.
-        times = [at]
+        times = []
         for field in ("svr_recv_time_bid", "svr_recv_time_ask"):
             value = book.get(field)
             if value and not value.startswith("1970"):
                 source = datetime.fromisoformat(value)
                 times.append(source.replace(tzinfo=NY) if source.tzinfo is None else source)
-        return min(times)
+        # Each side reports its last exchange update. An unchanged bid must
+        # not make a fresh ask/book update stale; date the complete snapshot by
+        # the latest side update, bounded by actual callback arrival.
+        return min(at, max(times)) if times else at
 
     def quotes(self, now):
         try:

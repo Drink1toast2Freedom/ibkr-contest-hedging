@@ -21,6 +21,7 @@ class ExecutionManager:
         self.last_preview = None
         self.preview_valid = False
         self.owned_inventory_ranges = {}
+        self.recovery_checks = None
 
     def unresolved(self):
         return [
@@ -60,7 +61,12 @@ class ExecutionManager:
                 corrective=not current_risk.passed,
                 day_zero=setup,
             )
-            if result.passed:
+            extra = (
+                self.recovery_checks(snapshot, quotes, scenarios, partial, 2 * costs)
+                if self.recovery_checks
+                else []
+            )
+            if result.passed and not extra:
                 candidates.append((result.metrics.get("stress_loss", float("inf")), i, signed, result))
         return candidates
 
@@ -155,8 +161,15 @@ class ExecutionManager:
                         ).passed,
                         day_zero=setup,
                     )
-                    if not refreshed.passed:
-                        raise ValueError("; ".join(refreshed.reasons))
+                    extra = (
+                        self.recovery_checks(
+                            fresh_snapshot, fresh_quotes, fresh_scenarios, partial, 2 * costs
+                        )
+                        if self.recovery_checks
+                        else []
+                    )
+                    if not refreshed.passed or extra:
+                        raise ValueError("; ".join([*refreshed.reasons, *extra]))
                     self.preview_valid = True
                 except Exception as exc:
                     self.store.transition(request.intent_id, "REJECTED")

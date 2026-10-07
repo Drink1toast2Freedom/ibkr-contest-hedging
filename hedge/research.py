@@ -140,8 +140,9 @@ class ReplayEngine:
     or a future bar's low/high. Full archival valuation is a scoring proxy.
     """
 
-    def __init__(self, manifest, variant=None, adverse_spreads=1.0):
+    def __init__(self, manifest, variant=None, adverse_spreads=1.0, recovery=None):
         self.manifest, self.variant, self.adverse_spreads = manifest, variant or Variant(), adverse_spreads
+        self.recovery = recovery
 
     def run(self, frame, history=None):
         frame = normalized_quotes(frame)
@@ -161,6 +162,9 @@ class ReplayEngine:
         closes, transactions, costs, rejected = {}, 0, 0.0, 0
         last_decision, last_option = None, None
         pending = []
+        pending_recovery = None
+        recovery_decision = None
+        recovery_choices, recovery_rejections = 0, 0
         last_marks = {}
         max_gross, max_stress = 0.0, 0.0
         previous_time = None
@@ -209,6 +213,8 @@ class ReplayEngine:
                         spot=float(row.spot),
                         observed_at=now,
                     )
+            if self.recovery:
+                self.recovery.observe_close(quotes, now)
             if not set(q).issubset(quotes):
                 continue
             if not initialized:
@@ -274,6 +280,22 @@ class ReplayEngine:
                     corrective=not gate.engine.evaluate(snap, quotes, scenarios, q).passed,
                 )
                 pending.remove((signal, identifier, signed))
+                if self.recovery and pending_recovery:
+                    from .recovery import recovery_budget_errors
+
+                    extra = recovery_budget_errors(
+                        m,
+                        self.recovery.config,
+                        snap,
+                        quotes,
+                        scenarios,
+                        target,
+                        pending_recovery,
+                        execution_cost(m, quotes, [identifier], [amount]),
+                    )
+                    if extra:
+                        recovery_rejections += 1
+                        continue
                 if not check.passed:
                     rejected += 1
                     continue
@@ -287,6 +309,37 @@ class ReplayEngine:
                 q[identifier] = target[identifier]
                 costs += abs(amount) * c.multiplier * abs(price - quote.mid) + fee
                 transactions += 1
+                if self.recovery:
+                    from .models import Execution, OrderRequest
+
+                    intention = OrderRequest(
+                        intent_id=digest([now, identifier, transactions]),
+                        account=m.account,
+                        con_id=identifier,
+                        signed_quantity=amount,
+                        limit_price=Decimal(str(price)),
+                        decision_id=recovery_decision or "hedge-replay",
+                        snapshot_id=snap.version,
+                    )
+                    store = self.recovery.store
+                    store.create_intent(intention)
+                    store.transition(intention.intent_id, "VALIDATED")
+                    store.transition(intention.intent_id, "SUBMITTING", order_id=transactions)
+                    store.transition(intention.intent_id, "ACKNOWLEDGED")
+                    store.execution(
+                        Execution(
+                            account=m.account,
+                            exec_id=f"replay.{transactions}",
+                            order_id=transactions,
+                            order_ref="hedge:" + intention.intent_id,
+                            con_id=identifier,
+                            signed_quantity=amount,
+                            price=Decimal(str(price)),
+                            at=now,
+                        )
+                    )
+                    store.fee(m.account, f"replay.{transactions}", Decimal(str(fee)))
+                    store.transition(intention.intent_id, "FILLED")
                 if signed != amount:
                     pending.append((now, identifier, signed - amount))
                 if cash == cash_before:
@@ -346,6 +399,52 @@ class ReplayEngine:
             result = optimizer.solve(
                 snap, quotes, scenarios, previous, stock_only=stock_only, strategy=self.variant.strategy
             )
+            pending_recovery = None
+            recovery_decision = None
+            if self.recovery and day != m.day_zero:
+                reference = result
+                if result.current_score - result.expected_score <= max(
+                    self.variant.threshold, m.policy.uncertainty_multiplier * result.uncertainty
+                ):
+                    reference = optimizer.evaluate_target(
+                        snap,
+                        quotes,
+                        scenarios,
+                        result.model_copy(update={"quantities": dict(q)}),
+                        previous,
+                        nav,
+                    )
+                recovered, shifted, detail = self.recovery.evaluate(
+                    optimizer, snap, quotes, scenarios, reference, previous, nav, now
+                )
+                if recovered is not None and all(
+                    q.get(i, 0) == reference.quantities.get(i, 0) for i in set(q) | set(reference.quantities)
+                ):
+                    from .recovery import recovery_budget_errors
+
+                    final_check = gate.validate(
+                        snap, quotes, scenarios, recovered.quantities, now, recovered.estimated_cost
+                    )
+                    extra = recovery_budget_errors(
+                        m,
+                        self.recovery.config,
+                        snap,
+                        quotes,
+                        scenarios,
+                        recovered.quantities,
+                        reference.quantities,
+                        recovered.estimated_cost,
+                    )
+                    if final_check.passed and not extra:
+                        pending_recovery = dict(reference.quantities)
+                        result = recovered
+                        scenarios = shifted
+                        recovery_choices += 1
+                        recovery_decision = self.recovery.store.record(
+                            "decision",
+                            m.account,
+                            {"recovery": True, "model_hash": detail.get("model_hash"), "at": now},
+                        )
             last_decision = now
             if not stock_only:
                 last_option = now
@@ -375,6 +474,12 @@ class ReplayEngine:
             abs(closes[b] - float(m.scoring_target(Decimal(str(closes[a])), b))) for a, b in pairwise(days)
         ]
         return {
+            "recovery_choices": recovery_choices,
+            "recovery_budget_rejections": recovery_rejections,
+            "evidence_class": "quote_based_combined_contest_replay"
+            if self.recovery
+            else "quote_based_hedge_replay",
+            "valuation_note": "Archival NAV proxy; not official IBKR closing marks",
             "variant": self.variant.name,
             "weekly_score": sum(scores),
             "daily_scores": scores,

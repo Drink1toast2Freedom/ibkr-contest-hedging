@@ -207,3 +207,24 @@ def test_option_book_one_minute_boundary_with_fresh_underlying(tmp_path):
     quotes = feed.quotes(now + timedelta(seconds=1))
     assert quotes[10].data_type == "live"
     assert all(q.data_type == "frozen" for i, q in quotes.items() if i != 10)
+
+
+def test_book_freshness_uses_latest_side_update_without_reviving_old_book():
+    from datetime import datetime
+
+    now = datetime(2026, 10, 7, 12, tzinfo=NY)
+    old = now - timedelta(minutes=10)
+    fresh = now - timedelta(seconds=1)
+    item = {
+        "book_push_count": 3,
+        "book_push_at": now.isoformat(),
+        "order_book": {
+            "Bid": [[195.0, 10]],
+            "Ask": [[195.01, 10]],
+            "svr_recv_time_bid": old.isoformat(),
+            "svr_recv_time_ask": fresh.isoformat(),
+        },
+    }
+    assert MoomooData.book_time(item) == fresh
+    item["order_book"]["svr_recv_time_ask"] = old.isoformat()
+    assert MoomooData.book_time(item) == old

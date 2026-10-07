@@ -35,6 +35,11 @@ class AISettings(BaseModel):
     enabled: bool
 
 
+class RecoverySettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: str
+
+
 class DailyRateImport(BaseModel):
     model_config = ConfigDict(extra="forbid")
     date: date
@@ -113,6 +118,19 @@ def create_app(service):
                 else "Score = sum |NAV today − NAV previous × (1 + r/360)|. Day 0 is the baseline.",
             )
         return page
+
+    @app.post("/api/recovery")
+    async def recovery_settings(body: RecoverySettings):
+        try:
+            async with service.control_lock:
+                if service.pending_recovery is not None:
+                    await service.execution.pause()
+                    service.pending_target = service.pending_recovery = None
+                    service.execution.recovery_checks = None
+                    service.mode = "SHADOW"
+                return service.recovery.set_mode(body.mode)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/state")
     async def state():
