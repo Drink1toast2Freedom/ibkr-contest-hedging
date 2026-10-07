@@ -1,8 +1,8 @@
 # Validation report — October 7, 2026
 
-The updated automated suite passed **102 tests**, with **0 failures, 0 errors,
+The updated automated suite passed **104 tests**, with **0 failures, 0 errors,
 0 skips**, including a fresh PostgreSQL database and Alembic migration. The
-suite ran in approximately 28 seconds. One nonblocking Starlette/httpx
+suite ran in approximately 27 seconds. One nonblocking Starlette/httpx
 TestClient deprecation warning remains. This is evidence of implementation
 behavior, not a guarantee of trading performance or maximum loss.
 
@@ -46,6 +46,10 @@ on process restart; live portfolio inventory remains IBKR's responsibility.
    setup. Apply them during setup with its exact mandate-construction rules.
 6. The margin preview omitted DAY time-in-force, triggering IBKR error 10349.
    Match the execution order's explicit DAY and regular-hours settings.
+7. Reject stale or non-live new hedge candidates before optimization, rather
+   than selecting an unexecutable target and relying only on its final rejection.
+8. A fresh option stream must also have a fresh, permitted underlying feed
+   before its model Greeks become executable.
 
 Regression tests cover these fixes. Tests and hypothetical inquiries did not
 submit, fill, cancel or replace any operational IBKR trading order.

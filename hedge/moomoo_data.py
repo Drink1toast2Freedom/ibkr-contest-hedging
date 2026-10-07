@@ -47,6 +47,9 @@ class MoomooData:
                     if at > now:
                         raise ValueError("Future provider timestamp")
                     stock = securities[f"US.{contract.symbol}"]["quote"][0]
+                    stock_at = datetime.fromisoformat(stock["data_date"] + "T" + stock["data_time"]).replace(
+                        tzinfo=NY
+                    )
                     spot = float(stock["last_price"])
                     bid, ask = float(book["Bid"][0][0]), float(book["Ask"][0][0])
                     live = False
@@ -63,6 +66,10 @@ class MoomooData:
                         )
                         live = (
                             permission in ("LV1", "LV2", "LV3", "SF")
+                            and raw.get("rights", {}).get("us_qot_right") in ("LV1", "LV2", "LV3", "SF")
+                            and timedelta(0)
+                            <= now - stock_at
+                            <= timedelta(seconds=self.manifest.risk.stock_quote_age)
                             and book_at.tzinfo is not None
                             and timedelta(0) <= now - book_at <= timedelta(seconds=max_age)
                             and timedelta(0) <= now - at <= timedelta(seconds=max_age)

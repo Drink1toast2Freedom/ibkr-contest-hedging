@@ -105,6 +105,23 @@ class HedgeOptimizer:
         candidates = [
             i for i in ids if i in m.allowlist and (not stock_only or m.contract_map[i].kind == "STK")
         ]
+        allowed_type = "synthetic" if snapshot.source == "synthetic" else "live"
+        candidates = [
+            i
+            for i in candidates
+            if quotes[i].data_type == allowed_type
+            and -1
+            <= (snapshot.at - quotes[i].observed_at).total_seconds()
+            <= (m.risk.option_quote_age if m.contract_map[i].kind == "OPT" else m.risk.stock_quote_age)
+            and (
+                m.contract_map[i].kind == "STK"
+                or (
+                    quotes[i].iv is not None
+                    and quotes[i].greek_at is not None
+                    and -1 <= (snapshot.at - quotes[i].greek_at).total_seconds() <= m.risk.greek_age
+                )
+            )
+        ]
         frozen = [i for i in ids if i not in candidates]
         if not candidates:
             return self._unchanged(snapshot, scenarios, error, quotes, "NO_CANDIDATES")

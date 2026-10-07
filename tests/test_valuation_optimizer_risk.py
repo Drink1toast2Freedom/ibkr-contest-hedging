@@ -165,3 +165,20 @@ def test_day_zero_forecasts_from_baseline_close_not_current_nav(manifest, snapsh
     result = HedgeOptimizer(manifest).solve(snap, shifted, sc, 12345)
     other = HedgeOptimizer(manifest).solve(snap, shifted, sc, 9999999)
     assert result.quantities == other.quantities
+
+
+def test_optimizer_never_selects_frozen_or_stale_new_hedges(manifest, snapshot, quotes, now):
+    from datetime import timedelta
+
+    from hedge.optimizer import HedgeOptimizer
+    from hedge.scenarios import ScenarioEngine
+
+    bad = dict(quotes)
+    for i in manifest.allowlist:
+        bad[i] = bad[i].model_copy(update={"data_type": "frozen"})
+    bad[10] = quotes[10].model_copy(update={"observed_at": now - timedelta(seconds=6)})
+    scenarios = ScenarioEngine(manifest).build(snapshot, bad, now)
+    target = HedgeOptimizer(manifest).solve(snapshot, bad, scenarios, snapshot.nav)
+    assert target.status == "NO_CANDIDATES"
+    assert target.quantities == snapshot.quantities()
+    assert target.estimated_cost == 0

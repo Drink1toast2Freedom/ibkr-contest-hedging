@@ -92,3 +92,32 @@ def test_stream_requires_fresh_prices_permissions_identity_and_later_book_pushes
     raw["rights"]["us_option_qot_right"] = "NO"
     p.write_text(json.dumps(raw))
     assert all(q.data_type == "frozen" for i, q in MoomooData(m, p).quotes(now).items() if i != 10)
+
+
+def test_fresh_option_cannot_use_stale_underlying_for_greeks(tmp_path):
+    from datetime import datetime
+
+    m = demo_manifest()
+    now = datetime.combine(m.scoring_sessions[0], datetime.min.time(), NY).replace(hour=10)
+    raw = fixture(m, now)
+    raw.update(
+        quote_server_connected=True,
+        rights={"us_qot_right": "LV3", "us_option_qot_right": "LV1"},
+        identities={},
+    )
+    for c in m.contracts:
+        item = raw["securities"][code_for(c)]
+        item["quote"][0].update(data_date=str(now.date()), data_time=now.time().isoformat())
+        item.update(book_push_at=now.isoformat(), book_push_count=2)
+        if c.kind == "OPT":
+            raw["identities"][code_for(c)] = {
+                "stock_owner": "US.BA",
+                "strike_time": str(c.expiry),
+                "option_type": "CALL" if c.right == "C" else "PUT",
+                "strike_price": c.strike,
+            }
+    stale = now - timedelta(seconds=6)
+    raw["securities"]["US.BA"]["quote"][0]["data_time"] = stale.time().isoformat()
+    path = tmp_path / "quotes.json"
+    path.write_text(json.dumps(raw))
+    assert all(q.data_type == "frozen" for q in MoomooData(m, path).quotes(now).values())
