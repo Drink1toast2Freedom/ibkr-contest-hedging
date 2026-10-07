@@ -159,6 +159,10 @@ class HedgeOptimizer:
             buying + selling <= 1,
             h - current == buy - sell,
         ]
+        for j, i in enumerate(candidates):
+            if m.contract_map[i].kind == "STK":
+                borrow_limit = quotes[i].shortable_shares or 0
+                constraints += [hneg[j] <= max(borrow_limit, max(0, -actual.get(i, 0)))]
         buy_sizes, sell_sizes, fees_buy, fees_sell, spread_cost = [], [], [], [], []
         for i in candidates:
             c, q = m.contract_map[i], quotes[i]

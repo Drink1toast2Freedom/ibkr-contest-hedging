@@ -36,6 +36,10 @@ class ScenarioEngine:
         self.manifest = manifest
         self.valuation = ValuationEngine(manifest)
         self.history = history
+        self.daily_history = (
+            pd.read_csv(manifest.daily_stock_history) if manifest.daily_stock_history else None
+        )
+        self.daily_cache = {}
 
     def build(self, snapshot, quotes, now, ids=None):
         ids = tuple(sorted(ids or quotes.keys()))
@@ -74,6 +78,25 @@ class ScenarioEngine:
                 shocks, iv_shocks = historical
                 n = len(next(iter(shocks.values())))
                 source = "historical matched-clock joint spot/IV paths"
+        if self.daily_history is not None:
+            if source.startswith("historical matched-clock"):
+                pass  # richer intraday history takes precedence
+            else:
+                covariance = self.daily_covariance(now, symbols)
+                shocks = dict(
+                    zip(
+                        symbols,
+                        (normals[:, 1:] @ np.linalg.cholesky(covariance).T * np.sqrt(days * 252 / 365)).T,
+                        strict=True,
+                    )
+                )
+                source = "prior daily joint returns, shrunk covariance; modeled intraday/IV scaling"
+        if (
+            len(symbols) > 1
+            and self.daily_history is None
+            and not source.startswith("historical matched-clock")
+        ):
+            raise ValueError("Joint historical coverage required for a cross-underlying hedge universe")
         changes = np.empty((n, len(ids)))
         for j, identifier in enumerate(ids):
             c, q = self.manifest.contract_map[identifier], quotes[identifier]
@@ -126,6 +149,31 @@ class ScenarioEngine:
         )
         return ScenarioSet(ids, changes, weights, stress, next_changes, days, source, identifier)
 
+    def daily_covariance(self, now, symbols):
+        """Aligned completed sessions only; no drift or future daily closes."""
+        key = (now.astimezone(NY).date(), tuple(symbols), self.manifest.policy.history_sessions)
+        if key in self.daily_cache:
+            return self.daily_cache[key]
+        frame = self.daily_history.copy()
+        frame["date"] = pd.to_datetime(frame["date"]).dt.date
+        frame = frame[frame.date < now.astimezone(NY).date()]
+        if frame.duplicated(["date", "symbol"]).any():
+            raise ValueError("Duplicate daily stock observations")
+        prices = frame.pivot(index="date", columns="symbol", values="close").sort_index()
+        if not set(symbols).issubset(prices.columns):
+            raise ValueError("Missing joint stock history for hedge universe")
+        prices = prices[list(symbols)].dropna()
+        if prices.empty or (now.astimezone(NY).date() - prices.index[-1]).days > 7:
+            raise ValueError("Joint stock history is stale")
+        returns = prices.pct_change(fill_method=None).dropna().tail(self.manifest.policy.history_sessions)
+        if len(returns) < 20 or not np.isfinite(returns.to_numpy()).all() or (prices <= 0).any().any():
+            raise ValueError("At least 20 aligned completed-session returns required")
+        empirical = returns.cov().to_numpy()
+        covariance = 0.8 * empirical + 0.2 * np.diag(np.diag(empirical))
+        covariance += np.eye(len(symbols)) * max(1e-10, np.trace(covariance) * 1e-6)
+        self.daily_cache[key] = covariance
+        return covariance
+
     def stress_matrix(self, ids, quotes, now, end):
         symbols = sorted({self.manifest.contract_map[i].symbol for i in ids})
         shifts = [
@@ -136,16 +184,19 @@ class ScenarioEngine:
         ]
         # Global correlated shocks plus individual underlying shocks.
         rows = []
+        repriced = {}
         for affected in [None, *symbols] if len(symbols) > 1 else [None]:
             for r, v, skew in shifts:
                 row = []
                 for i in ids:
                     c, q = self.manifest.contract_map[i], quotes[i]
                     applies = affected is None or c.symbol == affected
-                    change = self.valuation.scenario_change(
-                        c, q, now, end, r if applies else 0, v if applies else 0, skew if applies else 0
-                    )
-                    row.append(c.multiplier * change)
+                    key = (i, r if applies else 0, v if applies else 0, skew if applies else 0)
+                    if key not in repriced:
+                        repriced[key] = c.multiplier * self.valuation.scenario_change(
+                            c, q, now, end, *key[1:]
+                        )
+                    row.append(repriced[key])
                 rows.append(row)
         return np.array(rows)
 

@@ -136,3 +136,25 @@ between updates; permission, identity, spread, liquidity and risk checks remain
 in force. Boundary regression accepts a 60-second option book with a fresh
 underlying and rejects it at 61 seconds. The focused feed/valuation/optimizer/risk
 suite passed **31 tests**.
+
+## Expanded US stock/ETF universe
+
+Qualified six additional ETF contracts read-only through IBKR (SPY, XLI, ITA,
+QQQ, TLT, GLD). Moomoo supplied 1,162 prior completed daily bars across those
+ETFs and BA. The optimizer now has 21 configured instruments, including all
+previous contracts and held hedges. Joint daily-return covariance is regularized
+and excludes today's incomplete bar; intraday/IV scaling remains modeled.
+
+The full suite passed **113 tests, zero failures or skips**, including isolated
+PostgreSQL. Additional coverage checks read-only discovery, mandate preservation,
+no-lookahead daily scenarios, reproducibility, missing-history rejection, and
+unavailable stock borrow constraints. See EXPANDED_UNIVERSE.md for scope and
+reproduction. These results establish mechanics, not a guaranteed NAV target or
+held-out contest improvement.
+
+The expanded live collector returned all 21 instruments with no feed-quality
+notes in a market-hours sample. Shadow optimization returned OPTIMAL, and paper
+mode resumed with passing held-portfolio risk checks. In that sample the new
+ETFs were not selected: the best modeled improvement was below the unchanged
+$100 threshold. Do not infer that adding instruments necessarily increases
+trading or recovers existing NAV deviation.

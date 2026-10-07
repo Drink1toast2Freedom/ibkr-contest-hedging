@@ -89,9 +89,21 @@ def main():
     intake.add_argument("--expiry")
     intake.add_argument("--purchase-on-day", type=int, choices=[0, 1], default=0)
     intake.add_argument("--output", default="config/local.practice.inputs.yaml")
+    expand = commands.add_parser("expand-universe", help="Read-only qualify US stocks/ETFs")
+    expand.add_argument("--config", required=True)
+    expand.add_argument("--symbols", nargs="+", required=True)
+    expand.add_argument("--output", required=True)
     args = parser.parse_args()
     try:
-        if args.command == "validate":
+        if args.command == "expand-universe":
+            import yaml
+
+            from .universe_discovery import qualify_stock_universe
+
+            result = asyncio.run(qualify_stock_universe(load_manifest(args.config), args.symbols))
+            Path(args.output).write_text(yaml.safe_dump(result.model_dump(mode="json"), sort_keys=False))
+            print("Qualified universe saved; enable only after joint-history and quote validation")
+        elif args.command == "validate":
             manifest = load_manifest(args.config)
             print(
                 json.dumps(

@@ -78,6 +78,7 @@ class Manifest(Frozen):
     scoring_forecast_daily_rate: Decimal | None = Field(default=None, ge=0, le=1)
     scoring_forecast_source: str = ""
     market_data_provider: Literal["ibkr", "moomoo"] = "ibkr"
+    daily_stock_history: str | None = None
     initial_nav: Decimal = Field(default=Decimal("1000000"), gt=0)
     contracts: tuple[Contract, ...]
     mandatory: dict[int, int]

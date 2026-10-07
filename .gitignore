@@ -18,3 +18,5 @@ config/local*.yaml
 config/local.ai.json
 config/local.ai.tmp
 config/local.moomoo-codes.json
+
+config/local.*.json
