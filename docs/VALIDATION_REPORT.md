@@ -303,3 +303,14 @@ portfolio is compliant. No limit increase or directional recovery forecast is us
 Regression coverage verifies that an invalid failed-solver incumbent is discarded,
 the fallback preserves mandatory and discretionary options, and a healthy
 portfolio does not use this risk-only fallback. The full 155-test suite passed.
+
+Forward check on October 8 at approximately 12:43 Eastern: normal paper activation
+accepted the independently gated stock fallback. IBKR filled 23 BA shares at
+$186.47 (12:42:12) and 100 at $186.51 (12:42:27), increasing actual BA stock from
+200 to 323 shares. All option positions, including the two mandatory 25-contract
+positions, were unchanged. The observed BA dollar delta was approximately
+-$196,757 against a $199,310 cap; combined-portfolio risk passed with no active
+orders. PAPER mode continued, with subsequent ordinary proposals subject to
+modeled score improvement and uncertainty. These are point-in-time observations,
+not a guarantee of future compliance or evidence of improved contest performance.
+The next scheduled NAV capture was October 8 at 16:00 Eastern.
