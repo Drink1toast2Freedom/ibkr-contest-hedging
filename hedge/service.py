@@ -1099,7 +1099,7 @@ class TradingService:
                 "ai": self.store.records("supervisor", self.manifest.account, 1),
                 "ai_enabled": self.supervisor.enabled,
                 "ai_status": self.supervisor.status(),
-                "recovery": self.recovery.latest,
+                "recovery": {**self.recovery.latest, "promotion": self.recovery.promotion_status()},
                 "profile": self.profile,
                 "profiles": list(PROFILES if self.demo else self.supervisor.allowed_profiles),
                 "pause_pending": self.execution.pause_requested and not self.execution.pause_complete(),

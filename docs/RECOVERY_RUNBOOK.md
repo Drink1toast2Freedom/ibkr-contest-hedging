@@ -86,6 +86,14 @@ and validated execution paths. Bar-only results and synthetic fixtures are
 rejected. Approval is rechecked before selection and each slice; changed models
 invalidate an active recovery plan. AI cannot change these requirements.
 
+The dashboard displays promotion availability separately from forecasts and
+ordinary paper hedging. Until evidence passes, the paper recovery button is
+disabled and the expandable validation list identifies missing requirements.
+Missing contest scores are reported as unrecorded results, rather than measured
+underperformance. A direct API attempt still fails the same deterministic checks.
+Dashboard status uses a file-change cache without reading the bar archive;
+activation and execution continue to check current evidence independently.
+
 Available bar research shows small RMSE improvements relative to a zero-return
 forecast, before costs. That is not evidence of a profitable combined contest
 strategy. Actual daily cash-rate history, historical option/ETF NBBO, fill sizes,

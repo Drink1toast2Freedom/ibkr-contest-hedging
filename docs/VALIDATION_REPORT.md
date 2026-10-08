@@ -314,3 +314,21 @@ orders. PAPER mode continued, with subsequent ordinary proposals subject to
 modeled score improvement and uncertainty. These are point-in-time observations,
 not a guarantee of future compliance or evidence of improved contest performance.
 The next scheduled NAV capture was October 8 at 16:00 Eastern.
+
+## Recovery activation diagnostics
+
+The deployed promotion file contains bar-based forecast validation and zero
+qualifying combined quote-based contest windows; it does not contain combined
+mean or 90th-percentile contest scores. The prior diagnostic falsely described
+missing scores as measured underperformance. Missing results and invalid recorded
+metrics now have separate messages, while actual worse recorded results retain
+the corresponding performance rejection. The dashboard shows a cached,
+read-only promotion status and disables paper recovery until validation passes.
+Backend activation and every execution slice continue to require uncached evidence;
+no evidence, limits or promotion requirements were changed to enable recovery.
+
+All 163 tests passed with no failures or skips, including isolated PostgreSQL
+and dashboard controls. Regressions cover missing-versus-measured scores,
+nonfinite/non-numeric/negative metrics, evidence-change cache invalidation,
+missing files, disabled controls and escaped diagnostic text. Ordinary paper
+hedging and shadow recovery remain independently controlled.

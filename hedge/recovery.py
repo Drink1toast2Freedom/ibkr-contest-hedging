@@ -348,11 +348,21 @@ def rebase_forecasts(forecasts, quotes, manifest):
 
 def promotion_errors(config, bundle, evidence, manifest):
     errors = []
-    if any(
-        not np.isfinite(evidence.get(k, float("nan"))) or evidence.get(k, -1) < 0
-        for k in ("recovery_mean_score", "hedge_mean_score", "recovery_p90", "hedge_p90")
-    ):
-        errors.append("Finite nonnegative contest metrics required")
+    metrics = ("recovery_mean_score", "hedge_mean_score", "recovery_p90", "hedge_p90")
+
+    def valid_metric(key):
+        value = evidence.get(key)
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and np.isfinite(value)
+            and value >= 0
+        )
+
+    if any(key not in evidence for key in metrics):
+        errors.append("Combined contest score results have not been recorded")
+    if any(key in evidence and not valid_metric(key) for key in metrics):
+        errors.append("Finite nonnegative contest metrics required; recorded results are invalid")
     if evidence.get("model_hash") != bundle.get("model_hash"):
         errors.append("Evidence does not match frozen model")
     if evidence.get("contest_id") != manifest.contest_id:
@@ -361,11 +371,14 @@ def promotion_errors(config, bundle, evidence, manifest):
         errors.append("Evidence does not match the active risk/policy configuration")
     if evidence.get("evidence_class") != "quote_based_combined_contest_replay":
         errors.append("Combined quote-based contest replay required; bars are provisional")
-    if evidence.get("independent_test_windows", 0) < 20:
+    windows = evidence.get("independent_test_windows", 0)
+    if not isinstance(windows, int) or isinstance(windows, bool) or windows < 20:
         errors.append("At least 20 independent held-out contest windows required")
-    if not (0 <= evidence.get("recovery_mean_score", float("inf")) < evidence.get("hedge_mean_score", 0)):
+    if all(valid_metric(k) for k in metrics[:2]) and not (
+        evidence["recovery_mean_score"] < evidence["hedge_mean_score"]
+    ):
         errors.append("Held-out mean contest score did not improve")
-    if evidence.get("recovery_p90", float("inf")) > evidence.get("hedge_p90", 0):
+    if all(valid_metric(k) for k in metrics[2:]) and evidence["recovery_p90"] > evidence["hedge_p90"]:
         errors.append("Held-out tail contest score deteriorated")
     if not evidence.get("shadow_passed") or not evidence.get("operational_fault_tests_passed"):
         errors.append("Forward shadow and fault tests required")
@@ -390,6 +403,36 @@ class RecoveryController:
         self.config = RecoveryConfig.model_validate(manifest.recovery)
         self.mode = "shadow" if self.config.mode == "paper" else self.config.mode
         self.latest = {"mode": self.mode, "status": "Not evaluated", "forecasts": [], "candidates": []}
+        self._promotion_cache = None
+
+    def promotion_status(self):
+        """Cached dashboard explanation only; execution rechecks uncached evidence."""
+        paths = (Path(self.config.model_path), Path(self.config.evidence_path))
+        try:
+            stamps = tuple((p.stat().st_mtime_ns, p.stat().st_size) for p in paths)
+            if self._promotion_cache and self._promotion_cache[0] == stamps:
+                return self._promotion_cache[1]
+            bundle = verify_bundle(json.loads(paths[0].read_text()), self.config)
+            evidence = json.loads(paths[1].read_text())
+            blockers = promotion_errors(self.config, bundle, evidence, self.manifest)
+            count = evidence.get("independent_test_windows", 0)
+            status = {
+                "eligible": not blockers,
+                "status": "Validation passed" if not blockers else "Paper recovery unavailable: validation incomplete",
+                "blockers": blockers,
+                "evidence_class": evidence.get("evidence_class", "unavailable"),
+                "independent_test_windows": count if isinstance(count, int) and not isinstance(count, bool) else 0,
+            }
+            self._promotion_cache = (stamps, status)
+            return status
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            return {
+                "eligible": False,
+                "status": "Paper recovery unavailable: evidence missing or invalid",
+                "blockers": ["Recovery approval unavailable: " + str(exc)],
+                "evidence_class": "unavailable",
+                "independent_test_windows": 0,
+            }
 
     def data(self):
         historical = pd.read_parquet(self.config.bars_path)
@@ -418,7 +461,7 @@ class RecoveryController:
             evidence = json.loads(Path(self.config.evidence_path).read_text())
             errors = promotion_errors(self.config, bundle, evidence, self.manifest)
             if errors:
-                raise ValueError("; ".join(errors))
+                raise ValueError("Paper recovery unavailable; recovery mode unchanged. " + "; ".join(errors))
         self.mode = mode
         self.store.record("recovery_control", self.manifest.account, {"mode": mode})
         self.latest["mode"] = mode

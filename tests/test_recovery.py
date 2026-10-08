@@ -123,6 +123,49 @@ def test_bars_and_synthetic_results_never_promote(model, manifest):
     assert any("Finite" in r for r in promotion_errors(RecoveryConfig(), model, evidence, manifest))
 
 
+def test_missing_score_evidence_is_not_reported_as_measured_underperformance(manifest):
+    errors = promotion_errors(RecoveryConfig(), {}, {}, manifest)
+    assert "Combined contest score results have not been recorded" in errors
+    assert "Held-out mean contest score did not improve" not in errors
+    assert "Held-out tail contest score deteriorated" not in errors
+    measured = promotion_errors(
+        RecoveryConfig(), {},
+        {"recovery_mean_score": 3, "hedge_mean_score": 2, "recovery_p90": 4, "hedge_p90": 3},
+        manifest,
+    )
+    assert "Held-out mean contest score did not improve" in measured
+    assert "Held-out tail contest score deteriorated" in measured
+
+
+@pytest.mark.parametrize("invalid", [None, "1", True, -1, float("nan"), float("inf")])
+def test_invalid_score_evidence_remains_blocked(manifest, invalid):
+    errors = promotion_errors(RecoveryConfig(), {}, {"recovery_mean_score": invalid}, manifest)
+    assert any("Finite nonnegative" in error for error in errors)
+
+
+def test_dashboard_promotion_status_tracks_evidence_changes_without_bar_loading(
+    model, manifest, store, tmp_path, monkeypatch
+):
+    model_path = tmp_path / "model.json"
+    evidence_path = tmp_path / "evidence.json"
+    model_path.write_text(json.dumps(model))
+    evidence_path.write_text(json.dumps({"evidence_class": "bar_based_forecast_validation"}))
+    controller = RecoveryController(manifest, store)
+    controller.config = controller.config.model_copy(
+        update={"model_path": str(model_path), "evidence_path": str(evidence_path)}
+    )
+    monkeypatch.setattr(controller, "data", lambda: pytest.fail("Dashboard must not load bars"))
+    first = controller.promotion_status()
+    assert not first["eligible"] and first["independent_test_windows"] == 0
+    assert controller.promotion_status() is first  # no repeat model/archive read
+    evidence_path.write_text(json.dumps({"independent_test_windows": 5}))
+    assert controller.promotion_status()["independent_test_windows"] == 5
+    assert controller.mode == "off"
+    evidence_path.unlink()
+    assert not controller.promotion_status()["eligible"]
+    assert "missing or invalid" in controller.promotion_status()["status"]
+
+
 def test_recovery_joint_optimizer_budget_and_mandatory_protection(manifest, snapshot, quotes, now):
     spy = Contract(con_id=200, symbol="SPY", kind="STK")
     m = manifest.model_copy(update={"contracts": (*manifest.contracts, spy), "allowlist": (200,)})
