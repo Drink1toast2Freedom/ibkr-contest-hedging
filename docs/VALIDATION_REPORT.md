@@ -241,3 +241,24 @@ dashboard shows UAL, GE and XLE; main operation and recovery are shadow after
 market close. Fresh execution data will require regular-session verification.
 Crossed after-hours samples were rejected, not relabeled live or repaired to
 create apparent fills. No new positions were acquired during deployment.
+
+## Activation prerequisite diagnosis, October 8
+
+The paper portfolio's BA dollar delta exceeded its configured 20% cap while
+October 7 closing NAV was absent from the ledger. Optimization returned without
+a target, so the activation handler misleadingly reported only the current
+delta breach as an unavailable corrective hedge. No score-aware decision could
+be constructed without that session's previous closing value.
+
+A shared closing-target preflight now requires the correct previous session's
+NAV and actual benchmark or approved forecast before risk-correction optimization.
+Missing inputs clear stale targets and produce an explicit dashboard/control
+reason. Day 0 still uses the unscored setup reference; the old Day 0 baseline
+is not substituted for later missing closes. Limits and mandates are unchanged.
+
+All 132 tests passed, zero failures or skips, including isolated PostgreSQL.
+Regressions verify missing-baseline precedence over a delta breach, clearing old
+targets, missing-rate diagnostics, and successful independently gated corrective
+activation after the baseline is imported. Stale quotes and unsafe initial
+slices remain rejected. No source-less closing NAV or forced recovery trade
+was created to make activation pass.

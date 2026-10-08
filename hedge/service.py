@@ -425,6 +425,26 @@ class TradingService:
             or elapsed - self.last_optimization["OPT"] >= self.manifest.policy.option_seconds
         )
 
+    def closing_target(self, snapshot, now):
+        """Require the scored session's own baseline before generating a target."""
+        day = self.manifest.active_session(now)
+        if day is None:
+            raise ValueError("Outside the configured contest sessions")
+        if day == self.manifest.day_zero:
+            return snapshot.nav
+        previous = self.ledger.previous_close(day)
+        if previous is None:
+            sessions = (self.manifest.day_zero, *self.manifest.scoring_sessions)
+            previous_day = sessions[sessions.index(day) - 1]
+            raise ValueError(
+                f"Missing previous closing NAV for {previous_day}; import that IBKR closing NAV "
+                "before score-aware paper activation"
+            )
+        target = self.ledger.target_for(day, previous, allow_estimate=True)
+        if target is None:
+            raise ValueError("Daily cash benchmark rate or approved forecast required before paper trading")
+        return target
+
     async def optimize(self):
         if self.manifest.scoring_rule == "pending_interest_adjustment":
             self.health = "Scoring revision pending; interest-offset optimization disabled"
@@ -436,13 +456,16 @@ class TradingService:
                 self.last_scenarios,
                 self.now(),
             )
-            day = self.manifest.active_session(now)
-            previous = self.ledger.previous_close(day) if day else None
-            if day == self.manifest.day_zero:
-                previous = snap.nav  # initial hedge before unscored Day 0 baseline
-            elif previous is not None:
-                previous = self.ledger.target_for(day, previous, allow_estimate=True)
-            if previous is None or self.gate.registry.check(snap.quantities()):
+            try:
+                previous = self.closing_target(snap, now)
+            except ValueError as exc:
+                self.last_target = None
+                self.health = f"Optimization blocked: {exc}"
+                return
+            mandate_errors = self.gate.registry.check(snap.quantities())
+            if mandate_errors:
+                self.last_target = None
+                self.health = "; ".join(mandate_errors)
                 return
             full = (
                 self.force_optimize
@@ -828,6 +851,15 @@ class TradingService:
                 if not self.last_scenarios or not self.last_quotes:
                     raise ValueError("Waiting for quotes/scenario/risk validation")
                 if action == "paper":
+                    # Score prerequisites precede risk optimization: otherwise a
+                    # missing close makes optimize() return without a target and
+                    # disguises that cause as an uncorrectable inventory breach.
+                    try:
+                        self.closing_target(self.broker.snapshot(), self.now())
+                    except ValueError as exc:
+                        self.last_target = None
+                        self.health = f"Paper activation blocked: {exc}"
+                        raise
                     result = self.gate.validate(
                         self.broker.snapshot(),
                         self.broker.quotes(),
@@ -869,14 +901,6 @@ class TradingService:
                             self.now(),
                         ):
                             raise ValueError("Corrective hedge has no permitted risk-reducing first slice")
-                    day = self.manifest.active_session(self.now())
-                    if day != self.manifest.day_zero and self.ledger.previous_close(day) is None:
-                        raise ValueError("Official previous closing NAV required")
-                    if (
-                        day != self.manifest.day_zero
-                        and self.ledger.target_for(day, allow_estimate=True) is None
-                    ):
-                        raise ValueError("Actual daily cash benchmark rate required before paper trading")
                 else:
                     if (
                         not self.manifest.can_trade(self.now(), "OPT")

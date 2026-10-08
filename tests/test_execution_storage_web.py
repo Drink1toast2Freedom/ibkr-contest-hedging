@@ -213,7 +213,6 @@ async def test_paper_activation_can_correct_existing_delta_breach(store, manifes
     service.last_snapshot = snapshot
     service.last_quotes = service.broker.quotes()
     service.last_scenarios = ScenarioEngine(manifest).build(snapshot, service.last_quotes, now)
-    service.ledger.import_close(manifest.day_zero, manifest.initial_nav, "fixture", manifest.account)
     service.now = lambda: now
     assert service.last_target is None
 
@@ -221,6 +220,12 @@ async def test_paper_activation_can_correct_existing_delta_breach(store, manifes
         return snapshot
 
     service.reconcile = reconcile
+    with pytest.raises(ValueError, match=f"Missing previous closing NAV for {manifest.day_zero}"):
+        await service.control("paper")
+    assert service.mode == "PAUSED" and service.execution.paused
+    assert not service.broker.orders and service.last_target is None
+    assert "Missing previous closing NAV" in service.health
+    service.ledger.import_close(manifest.day_zero, manifest.initial_nav, "fixture", manifest.account)
     result = await service.control("paper")
     assert result["mode"] == "PAPER"
     assert not service.execution.paused
@@ -406,6 +411,55 @@ async def test_corrective_activation_requires_feasible_first_slice(store, manife
         await service.control("paper")
     assert service.mode == "PAUSED" and service.execution.paused
     assert not service.broker.orders
+
+
+async def test_missing_close_clears_old_target_and_explains_blocked_optimization(
+    store, manifest, quotes, now
+):
+    service = TradingService(manifest, store, demo=True)
+    service.now = lambda: now
+    await service.broker.connect()
+    service.broker.update_quotes(
+        {i: q.model_copy(update={"data_type": "synthetic"}) for i, q in quotes.items()}, now
+    )
+    service.last_snapshot = service.broker.snapshot()
+    service.last_quotes = service.broker.quotes()
+    service.last_scenarios = ScenarioEngine(manifest).build(service.last_snapshot, service.last_quotes, now)
+    service.last_target = Target(
+        quantities=service.last_snapshot.quantities(),
+        expected_score=0,
+        current_score=0,
+        uncertainty=0,
+        status="OPTIMAL",
+        snapshot_id="previous-session",
+        scenario_id="previous-session",
+        config_hash=manifest.config_hash,
+    )
+    await service.optimize()
+    assert service.last_target is None
+    assert f"Missing previous closing NAV for {manifest.day_zero}" in service.health
+    assert not service.broker.orders
+
+
+async def test_missing_cash_benchmark_is_reported_before_corrective_optimization(
+    store, manifest, quotes, now
+):
+    m = manifest.model_copy(update={"scoring_rule": "actual_daily_cash_rate"})
+    service = TradingService(m, store, demo=True)
+    service.now = lambda: now
+    await service.broker.connect()
+    service.broker.update_quotes(
+        {i: q.model_copy(update={"data_type": "synthetic"}) for i, q in quotes.items()}, now
+    )
+    service.broker.positions[10] = 1000
+    service.last_snapshot = service.broker.snapshot()
+    service.last_quotes = service.broker.quotes()
+    service.last_scenarios = ScenarioEngine(m).build(service.last_snapshot, service.last_quotes, now)
+    service.ledger.import_close(m.day_zero, m.initial_nav, "fixture", m.account)
+    with pytest.raises(ValueError, match="Daily cash benchmark rate or approved forecast required"):
+        await service.control("paper")
+    assert service.execution.paused and service.mode == "PAUSED"
+    assert not service.broker.orders and service.last_target is None
 
 
 def test_fast_policy_continues_evaluation_after_prior_trade(store, manifest, monkeypatch):
