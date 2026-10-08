@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .broker import IBKRBroker, SimBroker
+from .closing import ClosingRecorder
 from .config import NY
 from .data import QuoteRecorder
 from .demo import demo_quotes
@@ -85,6 +86,7 @@ class TradingService:
         self.recovery = RecoveryController(manifest, store)
         self.pending_recovery = None
         self.market_data_errors = {}
+        self.closing_recorder = ClosingRecorder(manifest, self.ledger, self.broker, self.now, self.alert, demo)
 
     def now(self):
         return self.demo_start + timedelta(seconds=time.monotonic() - self.started) if self.demo else utcnow()
@@ -135,6 +137,7 @@ class TradingService:
             asyncio.create_task(self._event_loop()),
             asyncio.create_task(self._monitor_loop()),
             asyncio.create_task(self._supervisor_loop()),
+            asyncio.create_task(self.closing_recorder.run()),
         ]
 
     async def stop(self):
@@ -1047,6 +1050,7 @@ class TradingService:
                 "account_nav_at": snap.account_at.isoformat() if snap else None,
                 "nav_report_source": self.manifest.report_source,
                 "official_account_nav": self.ledger.latest_report(),
+                "closing_recorder": self.closing_recorder.state(),
                 "provisional_score": abs(estimate - float(closing_target))
                 if estimate is not None and closing_target is not None
                 else None,

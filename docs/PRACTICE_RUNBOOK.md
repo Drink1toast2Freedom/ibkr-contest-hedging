@@ -4,6 +4,13 @@
 
 # Practice operation
 
+Automatic closing capture is now enabled for configured sessions, including
+early closes and Day 0. It requests fresh IBKR NAV after the scheduled close,
+retains timestamps/API provenance, and alerts if the three-minute window is missed.
+Keep the service and Paper TWS running. Imported statements can revise API captures;
+neither accrued interest nor fees are subtracted again. See
+[CLOSING_NAV_RECORDER.md](CLOSING_NAV_RECORDER.md) for retry and recovery behavior.
+
 > **Confirmed scoring revision:** Score = sum |NAV today − NAV previous × (1 + r/360)|, using the instructor’s approximate annual rate of 3.35%. The full prior NAV is the benchmark base. Do not subtract accrued interest separately. Official NAV comes from IBKR Custom Statement → Net Asset Value; live API NAV is a separately labeled monitoring observation.
 
 

@@ -262,3 +262,21 @@ targets, missing-rate diagnostics, and successful independently gated corrective
 activation after the baseline is imported. Stale quotes and unsafe initial
 slices remain rejected. No source-less closing NAV or forced recovery trade
 was created to make activation pass.
+
+## Automatic closing capture
+
+The supplied October 7 statement NAV ($995,294.19) was imported. Automatic
+exchange-close recording requests a fresh scoped IBKR NetLiquidation response,
+independently of trading mode and quote quality. Capture/retry windows, account
+identity, finite values and timestamps are validated; records retain API
+provenance and can be revised from statements. Existing closes win; stale or late
+startup values cannot backfill a missed session.
+
+All 147 tests passed, zero failures or skips, including isolated PostgreSQL.
+New coverage includes early closes, weekends, restarts, disconnect/retry,
+pre-close/late/nonfinite/wrong-account/wrong-source observations, statement races,
+fresh summary events rather than cached values, cleanup, startup/reconciliation
+serialization and qualification timeouts. JS/control checks and Ruff passed.
+The fresh account-summary query also succeeded with a separate read-only IBKR
+client without writing a closing ledger entry before market close. See
+CLOSING_NAV_RECORDER.md. The first real scheduled capture remains a forward check.

@@ -61,6 +61,12 @@ class TradingPolicy(Frozen):
         return self
 
 
+class ClosingCapturePolicy(Frozen):
+    enabled: bool = True
+    window_seconds: int = Field(default=180, ge=15, le=300)
+    retry_seconds: int = Field(default=15, ge=5, le=60)
+
+
 class Manifest(Frozen):
     name: str
     account: str
@@ -79,6 +85,7 @@ class Manifest(Frozen):
     scoring_forecast_source: str = ""
     market_data_provider: Literal["ibkr", "moomoo"] = "ibkr"
     daily_stock_history: str | None = None
+    closing_capture: ClosingCapturePolicy = ClosingCapturePolicy()
     recovery: dict = Field(default_factory=dict)
     initial_nav: Decimal = Field(default=Decimal("1000000"), gt=0)
     contracts: tuple[Contract, ...]

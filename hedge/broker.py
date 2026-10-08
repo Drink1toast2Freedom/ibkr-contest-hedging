@@ -15,6 +15,7 @@ from .models import Execution, PortfolioSnapshot, Position, Quote, WorkingOrder,
 class BrokerAdapter(Protocol):
     async def connect(self): ...
     async def reconcile(self) -> PortfolioSnapshot: ...
+    async def closing_nav_observation(self) -> dict: ...
     def snapshot(self) -> PortfolioSnapshot: ...
     def quotes(self) -> dict[int, Quote]: ...
     def reserve_order_id(self) -> int: ...
@@ -138,6 +139,19 @@ class IBKRBroker:
             )
 
     async def connect(self):
+        # connectAsync performs global account downloads too; a manual reconcile
+        # must not overwrite their completion futures during startup.
+        async with self.reconcile_lock:
+            self.qualified = self.reconciled = False
+            self.native.clear()
+            try:
+                await self._connect_and_qualify()
+            except BaseException:
+                self.qualified = self.reconciled = False
+                self.ib.disconnect()
+                raise
+
+    async def _connect_and_qualify(self):
         await self.ib.connectAsync(
             self.manifest.gateway_host,
             self.manifest.gateway_port,
@@ -153,7 +167,12 @@ class IBKRBroker:
             self.ib.disconnect()
             raise ValueError("Configured paper account not accessible; live trading is disabled")
         for c in self.manifest.contracts:
-            details = await self.ib.reqContractDetailsAsync(IBContract(conId=c.con_id, exchange=c.exchange))
+            try:
+                details = await asyncio.wait_for(
+                    self.ib.reqContractDetailsAsync(IBContract(conId=c.con_id, exchange=c.exchange)), 15
+                )
+            except TimeoutError as exc:
+                raise ConnectionError(f"Contract qualification timed out: {c.label}") from exc
             if len(details) != 1:
                 raise ValueError(f"Ambiguous/unavailable contract ID {c.con_id}")
             native = details[0].contract
@@ -181,7 +200,47 @@ class IBKRBroker:
         self.ib.reqMarketDataType(1)
         for native in self.native.values():
             self.ib.reqMktData(native, "236" if native.secType == "STK" else "", False, False)
-        await self.reconcile()
+        await self._download_state()
+
+    async def closing_nav_observation(self):
+        """Fresh, explicitly requested account NAV; never reuse summary cache."""
+        async with self.reconcile_lock:
+            if not self.ib.isConnected() or self.manifest.account not in self.ib.managedAccounts():
+                raise ConnectionError("Configured paper account unavailable for closing NAV capture")
+            observed = []
+
+            def receive(value):
+                if (
+                    value.account == self.manifest.account
+                    and value.tag == "NetLiquidation"
+                    and value.currency in ("BASE", "USD")
+                ):
+                    observed.append((Decimal(value.value), utcnow()))
+
+            request_at = utcnow()
+            request_id = self.ib.client.getReqId()
+            future = self.ib.wrapper.startReq(request_id)
+            self.ib.accountSummaryEvent += receive
+            try:
+                self.ib.client.reqAccountSummary(request_id, "All", "NetLiquidation")
+                await asyncio.wait_for(future, 15)
+                if not observed or any(not value.is_finite() for value, _ in observed):
+                    raise ValueError("Fresh IBKR closing NAV unavailable")
+                if len({value for value, _ in observed}) != 1:
+                    raise ValueError("Inconsistent closing NAV observations; retry capture")
+                nav, observed_at = observed[-1]
+                return {
+                    "account": self.manifest.account,
+                    "nav": nav,
+                    "requested_at": request_at,
+                    "observed_at": observed_at,
+                    "source": "ibkr",
+                }
+            finally:
+                self.ib.accountSummaryEvent -= receive
+                self.ib.wrapper._endReq(request_id)
+                if self.ib.isConnected():
+                    self.ib.client.cancelAccountSummary(request_id)
 
     async def reconcile(self):
         # Several IB requests use one global completion future. Overlapping
@@ -472,6 +531,17 @@ class SimBroker:
     async def reconcile(self):
         self.reconciled = self.connected
         return self.snapshot()
+
+    async def closing_nav_observation(self):
+        if not self.connected:
+            raise ConnectionError("Simulator disconnected")
+        return {
+            "account": self.manifest.account,
+            "nav": self.nav,
+            "requested_at": self.now,
+            "observed_at": self.now,
+            "source": "synthetic",
+        }
 
     def snapshot(self):
         return PortfolioSnapshot(
