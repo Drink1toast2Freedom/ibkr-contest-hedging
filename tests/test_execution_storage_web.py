@@ -462,6 +462,63 @@ async def test_missing_cash_benchmark_is_reported_before_corrective_optimization
     assert not service.broker.orders and service.last_target is None
 
 
+@pytest.mark.parametrize("breached", [False, True])
+async def test_failed_full_solve_only_uses_stock_delta_fallback_for_existing_breach(
+    store, manifest, quotes, now, monkeypatch, breached
+):
+    service = TradingService(manifest, store, demo=True)
+    service.now = lambda: now
+    await service.broker.connect()
+    service.broker.update_quotes(
+        {i: q.model_copy(update={"data_type": "synthetic"}) for i, q in quotes.items()}, now
+    )
+    if breached:
+        service.broker.positions[10] = 1000
+    service.last_snapshot = service.broker.snapshot()
+    service.last_quotes = service.broker.quotes()
+    service.last_scenarios = ScenarioEngine(manifest).build(service.last_snapshot, service.last_quotes, now)
+    service.ledger.import_close(manifest.day_zero, manifest.initial_nav, "fixture", manifest.account)
+    original = service.optimizer.solve
+    calls = []
+
+    def solve(snapshot, qs, scenarios, previous, estimate, stock_only, strategy):
+        calls.append((stock_only, strategy))
+        if len(calls) == 1:
+            return Target(
+                quantities={101: 0},  # invalid incumbent must be discarded
+                expected_score=0,
+                current_score=0,
+                uncertainty=0,
+                status="USER_LIMIT",
+                snapshot_id=snapshot.version,
+                scenario_id=scenarios.identifier,
+                config_hash=manifest.config_hash,
+            )
+        return original(snapshot, qs, scenarios, previous, estimate, stock_only, strategy)
+
+    monkeypatch.setattr(service.optimizer, "solve", solve)
+    service.force_optimize = True
+    service.mode = "SHADOW"
+    await service.optimize()
+    if breached:
+        assert calls == [(False, "dynamic_l1"), (True, "delta")]
+        assert service.last_target.status == "OPTIMAL"
+        before = service.last_snapshot.quantities()
+        assert all(
+            service.last_target.quantities.get(i, 0) == before.get(i, 0)
+            for i, c in manifest.contract_map.items()
+            if c.kind == "OPT"
+        )
+        record = store.records("decision", manifest.account)[0]
+        assert record["rejected_primary_solver"] == "USER_LIMIT"
+        assert record["optimization_scope"] == "CORRECTIVE_STOCK"
+        assert record["risk_passed"] and record["trade_eligible"]
+    else:
+        assert calls == [(False, "dynamic_l1")]
+        assert service.last_target.status == "USER_LIMIT"
+    assert not service.broker.orders
+
+
 def test_fast_policy_continues_evaluation_after_prior_trade(store, manifest, monkeypatch):
     from hedge.config import TradingPolicy
 

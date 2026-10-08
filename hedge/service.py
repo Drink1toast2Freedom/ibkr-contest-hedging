@@ -86,7 +86,9 @@ class TradingService:
         self.recovery = RecoveryController(manifest, store)
         self.pending_recovery = None
         self.market_data_errors = {}
-        self.closing_recorder = ClosingRecorder(manifest, self.ledger, self.broker, self.now, self.alert, demo)
+        self.closing_recorder = ClosingRecorder(
+            manifest, self.ledger, self.broker, self.now, self.alert, demo
+        )
 
     def now(self):
         return self.demo_start + timedelta(seconds=time.monotonic() - self.started) if self.demo else utcnow()
@@ -485,6 +487,33 @@ class TradingService:
                 not full,
                 PROFILES[self.profile],
             )
+            failed_primary = None
+            current_risk = self.gate.engine.evaluate(snap, quotes, scenarios, snap.quantities())
+            if target.status != "OPTIMAL" and any(
+                reason.startswith("Residual delta cap:") for reason in current_risk.reasons
+            ):
+                # Discard the failed solve entirely. A new, smaller risk solve
+                # freezes every option and neutralizes delta through stocks,
+                # while retaining all hard combined-portfolio constraints.
+                failed_primary = target.status
+                refreshed = self.broker.snapshot()
+                if refreshed.quantities() != snap.quantities() or refreshed.orders != snap.orders:
+                    self.force_optimize = True
+                    return
+                snap, quotes, now = refreshed, dict(self.broker.quotes()), self.now()
+                previous = self.closing_target(snap, now)
+                ids = screen_options(self.manifest, quotes, snap.quantities())
+                scenarios = await asyncio.to_thread(self.scenarios.build, snap, quotes, now, ids)
+                self.last_snapshot, self.last_quotes, self.last_scenarios = snap, quotes, scenarios
+                estimate = self.nav_tracker.estimate(snap, quotes, self.manifest.contract_map)
+                target = await asyncio.to_thread(
+                    self.optimizer.solve, snap, quotes, scenarios, previous, estimate, True, "delta"
+                )
+                target = target.model_copy(
+                    update={
+                        "explanation": f"Corrective stock-only delta hedge after rejected solver {failed_primary}"
+                    }
+                )
             # Broker inventory/order changes during optimization invalidate its decision.
             newest = self.broker.snapshot()
             if newest.quantities() != snap.quantities() or newest.orders != snap.orders:
@@ -524,6 +553,7 @@ class TradingService:
             baseline_quantities = dict(recovery_baseline.quantities)
             if (
                 self.recovery.mode == "paper"
+                and failed_primary is None
                 and recovery_target is not None
                 and not self.recovery.paper_errors(recovery_record.get("model_hash"))
             ):
@@ -572,11 +602,12 @@ class TradingService:
                 and target.status == "OPTIMAL"
                 and (improvement > threshold or corrective),
                 "corrective": corrective,
+                "rejected_primary_solver": failed_primary,
                 "recovery": recovery_selected,
                 "recovery_reference": baseline_quantities if recovery_selected else None,
                 "nav_gap": estimate - float(previous),
                 "closing_target": float(previous),
-                "optimization_scope": "FULL" if full else "STOCK",
+                "optimization_scope": "CORRECTIVE_STOCK" if failed_primary else "FULL" if full else "STOCK",
                 "hold_distance": target.current_score,
                 "proposed_distance": target.expected_score,
                 "blocking_reasons": (

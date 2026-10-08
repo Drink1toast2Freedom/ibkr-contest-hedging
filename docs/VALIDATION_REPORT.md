@@ -272,7 +272,7 @@ identity, finite values and timestamps are validated; records retain API
 provenance and can be revised from statements. Existing closes win; stale or late
 startup values cannot backfill a missed session.
 
-All 153 tests passed, zero failures or skips, including isolated PostgreSQL.
+All 155 tests passed, zero failures or skips, including isolated PostgreSQL.
 New coverage includes early closes, weekends, restarts, disconnect/retry,
 pre-close/late/nonfinite/wrong-account/wrong-source observations, statement races,
 fresh summary events rather than cached values, cleanup, startup/reconciliation
@@ -287,3 +287,19 @@ direct submissions still reject unqualified IDs. Mandatory contracts, filled
 positions, orders and option underlyings remain required. A native contract-ID
 mismatch is rejected. The operator restarted TWS, restoring the original full
 universe lookup before final activation checks; limits were not raised.
+
+## Corrective solve after a deadline
+
+After restoring the baseline and TWS connection, the full mixed-integer solve
+hit its 10-second deadline. Its unaccepted result was discarded, leaving the
+existing BA residual delta breach unresolved. The service now attempts a separate
+stock-only delta solve when the primary solve fails and the actual portfolio
+already breaches a residual delta limit. Every option quantity is frozen to actual
+inventory, and all combined-portfolio risk constraints remain enforced. Refreshed
+broker state and quotes invalidate obsolete targets; the independent execution
+gate still validates each slice. Ordinary score optimization resumes once the
+portfolio is compliant. No limit increase or directional recovery forecast is used.
+
+Regression coverage verifies that an invalid failed-solver incumbent is discarded,
+the fallback preserves mandatory and discretionary options, and a healthy
+portfolio does not use this risk-only fallback. The full 155-test suite passed.
