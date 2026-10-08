@@ -18,12 +18,14 @@ dev = ["pytest", "pytest-asyncio", "ruff"]
 
 [project.scripts]
 hedge = "hedge.cli:main"
+hedge-surplus = "surplus_addon.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["hedge*"]
+include = ["hedge*", "surplus_addon*"]
 
 [tool.setuptools.package-data]
 hedge = ["web/*"]
+surplus_addon = ["web/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

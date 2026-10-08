@@ -136,6 +136,13 @@ def create_app(service):
     async def state():
         return service.state()
 
+    @app.get("/api/addons/surplus-input")
+    async def surplus_input():
+        try:
+            return service.surplus_snapshot()
+        except ValueError as exc:
+            raise HTTPException(503, str(exc)) from None
+
     @app.post("/api/control")
     async def control(body: Control):
         try:

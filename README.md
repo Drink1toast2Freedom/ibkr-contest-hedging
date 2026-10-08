@@ -24,6 +24,12 @@ Follow [the practice runbook](docs/PRACTICE_RUNBOOK.md) for paper TWS setup, rea
 
 ## Open the dashboard
 
+The independent [surplus research add-on](docs/SURPLUS_ADDON.md) runs on
+<http://127.0.0.1:8770/>. Double-click `Start Surplus Add-on.command` or run
+`.venv/bin/python -m surplus_addon serve`. It reads the main app, shows bounded
+expense-cycle proposals, and supports a fictional feedback rehearsal. It cannot
+submit IBKR or moomoo orders; paper expense execution is not integrated.
+
 Dependencies are already installed in this workspace's `.venv` (Python 3.12).
 
 ```sh

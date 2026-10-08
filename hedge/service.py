@@ -66,6 +66,10 @@ class TradingService:
         self.last_risk = None
         self.last_target = None
         self.last_scenarios = None
+        self.broker_event_revision = 0
+        self.last_scenario_at = None
+        self.last_scenario_snapshot_id = None
+        self.last_scenario_revision = None
         self.last_optimization = {"STK": 0.0, "OPT": 0.0}
         self.last_trade = {"STK": 0.0, "OPT": 0.0}
         self.last_reconcile = 0.0
@@ -172,6 +176,17 @@ class TradingService:
         while True:
             event, value = await self.events.get()
             try:
+                if event in (
+                    "position",
+                    "execution",
+                    "commission",
+                    "order",
+                    "package_execution",
+                    "package_commission",
+                    "disconnected",
+                    "unsupported_execution",
+                ):
+                    self.broker_event_revision += 1
                 self.store.record(
                     "broker_event", self.manifest.account, {"event": event, "value": payload(value)}
                 )
@@ -327,9 +342,15 @@ class TradingService:
                         self.alert("error", self.health)
                 if self.last_quotes:
                     ids = screen_options(self.manifest, self.last_quotes, self.last_snapshot.quantities())
+                    scenario_at = self.now()
+                    scenario_snapshot_id = self.last_snapshot.version
+                    scenario_revision = self.broker_event_revision
                     self.last_scenarios = await asyncio.to_thread(
-                        self.scenarios.build, self.last_snapshot, self.last_quotes, self.now(), ids
+                        self.scenarios.build, self.last_snapshot, self.last_quotes, scenario_at, ids
                     )
+                    self.last_scenario_at = scenario_at
+                    self.last_scenario_snapshot_id = scenario_snapshot_id
+                    self.last_scenario_revision = scenario_revision
                     self.last_risk = self.gate.validate(
                         self.last_snapshot,
                         self.last_quotes,
@@ -519,8 +540,12 @@ class TradingService:
                 snap, quotes, now = refreshed, dict(self.broker.quotes()), self.now()
                 previous = self.closing_target(snap, now)
                 ids = screen_options(self.manifest, quotes, snap.quantities())
+                scenario_revision = self.broker_event_revision
                 scenarios = await asyncio.to_thread(self.scenarios.build, snap, quotes, now, ids)
                 self.last_snapshot, self.last_quotes, self.last_scenarios = snap, quotes, scenarios
+                self.last_scenario_at = now
+                self.last_scenario_snapshot_id = snap.version
+                self.last_scenario_revision = scenario_revision
                 estimate = self.nav_tracker.estimate(snap, quotes, self.manifest.contract_map)
                 target = await asyncio.to_thread(
                     self.optimizer.solve, snap, quotes, scenarios, previous, estimate, True, "delta"
@@ -1065,6 +1090,59 @@ class TradingService:
             else:
                 raise ValueError("Unknown control")
             return self.state()
+
+    def surplus_snapshot(self):
+        """Read-only research export. Never contacts the broker or creates an intent."""
+        snap, scenarios = self.last_snapshot, self.last_scenarios
+        if snap is None:
+            raise ValueError("Waiting for the main app's reconciled portfolio snapshot")
+        now = self.now()
+        day = self.manifest.active_session(now)
+        previous = self.ledger.previous_close(day) if day in self.manifest.scoring_sessions else None
+        target = self.ledger.target_for(day, previous, allow_estimate=True) if previous is not None else None
+        official_target = self.ledger.target_for(day, previous) if previous is not None else None
+        try:
+            estimate = self.nav_tracker.estimate(snap, self.last_quotes, self.manifest.contract_map)
+        except ValueError:
+            estimate = None
+        return payload(
+            {
+                "protocol": "surplus-research-v1",
+                "generated_at": now,
+                "manifest": self.manifest.model_dump(mode="json"),
+                "snapshot": snap.model_dump(mode="json"),
+                "quotes": {i: q.model_dump(mode="json") for i, q in self.last_quotes.items()},
+                "scenarios": None
+                if scenarios is None
+                else {
+                    "ids": scenarios.ids,
+                    "changes": scenarios.changes.tolist(),
+                    "weights": scenarios.weights.tolist(),
+                    "stress": scenarios.stress.tolist(),
+                    "calendar_days": scenarios.calendar_days,
+                    "source": scenarios.source,
+                    "identifier": scenarios.identifier,
+                },
+                "scenario_at": self.last_scenario_at,
+                "scenario_snapshot_id": self.last_scenario_snapshot_id,
+                "scenario_revision": self.last_scenario_revision,
+                "broker_revision": self.broker_event_revision,
+                "baseline_nav": self.ledger.closes().get(self.manifest.day_zero),
+                "nav_estimate": estimate,
+                "target": target,
+                "target_estimated": target is not None and official_target is None,
+                "forecast_close": self.manifest.next_close(self.last_scenario_at or now),
+                "main_mode": self.mode,
+                "execution_busy": bool(
+                    snap.orders
+                    or self.pending_target
+                    or self.pending_recovery
+                    or self.store.intents(self.manifest.account, True)
+                ),
+                "config_hash": self.manifest.config_hash,
+                "snapshot_id": snap.version,
+            }
+        )
 
     def state(self):
         snap = self.last_snapshot
