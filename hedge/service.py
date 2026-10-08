@@ -14,13 +14,14 @@ from .config import NY
 from .data import QuoteRecorder
 from .demo import demo_quotes
 from .execution import ExecutionManager
-from .models import Target, digest, utcnow
+from .models import digest, utcnow
 from .moomoo_data import MoomooData
-from .optimizer import HedgeOptimizer
+from .optimizer import HedgeOptimizer, execution_cost
 from .recovery import RecoveryController, recovery_budget_errors
 from .risk import RiskGate
 from .scenarios import ScenarioEngine
 from .scoring import ScoreLedger
+from .setup import SetupPlanner
 from .storage import payload
 from .supervisor import PROFILES, Supervisor
 from .universe import screen_options
@@ -82,7 +83,14 @@ class TradingService:
         self.active_plan_started = False
         self.setup_armed = False
         self.setup_target_quantities = None
+        self.setup_pairs = {}
+        self.setup_decision_id = None
         self.auto_hedge_after_setup = False
+        self.execution.score_context = lambda snapshot, qs, now: (
+            self.closing_target(snapshot, now),
+            self.nav_tracker.estimate(snapshot, qs, self.manifest.contract_map),
+        )
+        self.setup_planner = SetupPlanner(manifest, self.gate)
         self.recovery = RecoveryController(manifest, store)
         self.pending_recovery = None
         self.market_data_errors = {}
@@ -172,7 +180,7 @@ class TradingService:
                     if fresh:
                         self.execution.on_execution(value)
                         self.nav_tracker.execution(value)
-                        if not value.order_ref.startswith("hedge:"):
+                        if not value.order_ref.startswith(("hedge:", "hedge-package:")):
                             self.force_optimize = True
                             self.pending_target = None
                             self.active_plan_started = False
@@ -181,6 +189,8 @@ class TradingService:
                         self.manifest.account, value["exec_id"], value["amount"], value["currency"]
                     )
                     self.nav_tracker.fee(value["exec_id"], value["amount"])
+                elif event in ("package_execution", "package_commission"):
+                    self.store.record(event, self.manifest.account, value)
                 elif event == "order":
                     self.execution.on_order(value)
                 elif event in ("disconnected", "unsupported_execution"):
@@ -214,7 +224,9 @@ class TradingService:
                             self.store.transition(row["id"], "UNKNOWN")
                         self.execution.on_order(
                             {
-                                "order_ref": "hedge:" + row["id"],
+                                "order_ref": ("hedge-package:" + row["package_id"])
+                                if row.get("package_id")
+                                else "hedge:" + row["id"],
                                 "order_id": value["order_id"],
                                 "status": "Inactive" if value["code"] == 201 else "Cancelled",
                             }
@@ -254,7 +266,7 @@ class TradingService:
         if (
             snapshot.quantities() != prior
             or self.execution.unresolved()
-            or any(not o.order_ref.startswith("hedge:") for o in snapshot.orders)
+            or any(not o.order_ref.startswith(("hedge:", "hedge-package:")) for o in snapshot.orders)
         ):
             self.pending_target = None
             self.active_plan_started = False
@@ -348,7 +360,9 @@ class TradingService:
                             await self.optimize()
                     elif self.mode == "SETUP":
                         await self._setup_slice()
-                    elif self.mode == "WAITING_SETUP" and self.manifest.can_trade(self.now(), "OPT"):
+                    elif self.mode == "WAITING_SETUP" and self.manifest.can_trade(
+                        self.now(), "OPT", setup=True
+                    ):
                         if self.now().astimezone(NY).date() == self.manifest.purchase_session:
                             try:
                                 await self.control("setup")
@@ -371,6 +385,7 @@ class TradingService:
                             )
                 if self.mode == "PAPER" and self.pending_target:
                     await self._execute_pending()
+                self.execution.current_scenarios = self.last_scenarios
                 await self.execution.manage(self.last_quotes, self.now())
                 if self.execution.paused and self.mode in ("PAPER", "SETUP"):
                     self.mode = "PAUSED"
@@ -380,10 +395,11 @@ class TradingService:
                         if self.execution.pause_complete()
                         else "Pause requested — awaiting broker confirmation"
                     )
-                if self.setup_armed and self.now() >= self.manifest.session_close(
+                if (self.setup_armed or self.mode == "SETUP") and self.now() >= self.manifest.session_close(
                     self.manifest.purchase_session
-                ) - timedelta(minutes=self.manifest.policy.option_cutoff_minutes):
+                ) - timedelta(minutes=self.manifest.execution.setup_cutoff_minutes):
                     self.setup_armed = self.auto_hedge_after_setup = False
+                    await self.execution.pause()
                     self.mode = "PAUSED"
                     self.alert(
                         "error",
@@ -744,69 +760,86 @@ class TradingService:
                 self.force_optimize = True
 
     def _setup_quantities(self, snapshot, quotes):
-        desired = {**snapshot.quantities(), **self.manifest.mandatory}
-        for stock in self.manifest.contracts:
-            if stock.kind != "STK" or stock.con_id not in self.manifest.allowlist:
-                continue
-            options = [
-                c for c in self.manifest.contracts if c.kind == "OPT" and c.underlying_id == stock.con_id
-            ]
-            option_delta = sum(
-                desired.get(c.con_id, 0) * c.multiplier * quotes[c.con_id].delta
-                for c in options
-                if desired.get(c.con_id, 0)
-            )
-            desired[stock.con_id] = -round(option_delta)
-        return desired
+        plan = self.setup_planner.plan(snapshot, quotes, self.last_scenarios, self.now())
+        self.setup_pairs = plan["pairs"]
+        self.setup_target = plan["target"]
+        return dict(plan["target"].quantities)
 
     async def _setup_slice(self):
         snap = self.broker.snapshot()
         if snap.orders or self.store.intents(snap.account, True):
             return
-        if self.setup_target_quantities is None:
-            self.setup_target_quantities = self._setup_quantities(snap, self.broker.quotes())
+        quotes = self.broker.quotes()
+        if self.setup_target_quantities is None or not self.setup_pairs:
+            raise ValueError("A complete protected setup plan is required before purchasing")
         desired = dict(self.setup_target_quantities)
-        complete = not self.gate.registry.check(snap.quantities())
-        risk_ok = (
-            self.gate.validate(
-                snap, self.broker.quotes(), self.last_scenarios, snap.quantities(), self.now()
-            ).passed
-            if complete
-            else False
-        )
-        if complete and risk_ok:
+        actual = snap.quantities()
+        # Stock hedges and any existing inventory adjustments are established
+        # first. Each subsequent mandate increment arrives with its option hedge.
+        prepared = dict(desired)
+        for i, h in self.setup_pairs.items():
+            prepared[i] = actual.get(i, 0)
+            prepared[h] = desired[h] + self.manifest.mandatory[i] - actual.get(i, 0)
+        if any(actual.get(i, 0) != q for i, q in prepared.items()):
+            target = self.setup_target.model_copy(
+                update={
+                    "quantities": prepared,
+                    "snapshot_id": snap.version,
+                    "scenario_id": self.last_scenarios.identifier,
+                }
+            )
+            result = await self.execution.submit_slice(
+                target, self.setup_decision_id, snap, quotes, self.last_scenarios, self.now(), setup=True
+            )
+            self.health = "Initial hedge preparation submitted" if result["submitted"] else result["reason"]
+            return
+        complete = not self.gate.registry.check(actual)
+        if complete:
+            risk = self.gate.validate(snap, quotes, self.last_scenarios, actual, self.now(), day_zero=True)
+            if not risk.passed:
+                raise ValueError("Completed setup risk: " + "; ".join(risk.reasons))
             await self.reconcile()
-            if self.gate.registry.check(self.broker.snapshot().quantities()):
-                raise ValueError("Mandatory fills did not reconcile")
+            actual = self.broker.snapshot().quantities()
+            if self.gate.registry.check(actual) or any(
+                actual.get(h, 0) > -actual.get(i, 0) for i, h in self.setup_pairs.items()
+            ):
+                raise ValueError("Protected setup fills did not reconcile")
             self.mode = "SHADOW"
             self.execution.paused = True
             self.broker.readonly = True
             self.force_optimize = True
-            self.health = "Mandatory purchases reconciled; initial hedge proposals run in shadow mode"
-            self.store.record("setup_complete", snap.account, {"quantities": desired, "at": self.now()})
+            self.health = "Mandatory and initial hedge holdings reconciled; protected setup complete"
+            self.store.record(
+                "setup_complete",
+                snap.account,
+                {"quantities": actual, "pairs": self.setup_pairs, "at": self.now()},
+            )
             return
-        target = Target(
-            quantities=desired,
-            expected_score=0,
-            current_score=0,
-            uncertainty=0,
-            status="MANDATORY_SETUP",
-            snapshot_id=snap.version,
-            scenario_id=self.last_scenarios.identifier,
-            config_hash=self.manifest.config_hash,
+        candidates = []
+        for i, h in self.setup_pairs.items():
+            if actual.get(i, 0) >= self.manifest.mandatory[i]:
+                continue
+            if actual.get(h, 0) > -actual.get(i, 0):
+                raise ValueError("Unmatched mandatory package leg; stop and reconcile")
+            amounts = {**actual, i: actual.get(i, 0) + 1, h: actual.get(h, 0) - 1}
+            costs = execution_cost(self.manifest, quotes, [i, h], [1, -1])
+            risk = self.gate.validate(
+                snap, quotes, self.last_scenarios, amounts, self.now(), 2 * costs, day_zero=True
+            )
+            if risk.passed:
+                candidates.append((risk.metrics["stress_loss"], i, h))
+        if not candidates:
+            self.health = "Protected setup waiting: no matched package passes current risk"
+            return
+        _, i, h = min(candidates)
+        result = await self.execution.submit_package(
+            i, h, self.setup_decision_id, snap, quotes, self.last_scenarios, self.now()
         )
-        decision = self.store.record(
-            "decision",
-            snap.account,
-            {
-                **target.model_dump(mode="json"),
-                "explanation": "Buy missing mandatory positions on the configured purchase session",
-            },
+        self.health = (
+            "Guaranteed mandatory + hedge option package submitted"
+            if result["submitted"]
+            else result["reason"]
         )
-        result = await self.execution.submit_slice(
-            target, decision, snap, self.last_quotes, self.last_scenarios, self.now(), setup=True
-        )
-        self.health = "Mandatory purchase submitted" if result["submitted"] else result["reason"]
 
     async def _supervisor_loop(self):
         # Independent of quotes, optimization and operating mode. Failures cannot
@@ -860,7 +893,7 @@ class TradingService:
                     raise ValueError("Resolve working or uncertain orders before enabling execution")
                 if action == "arm_setup":
                     deadline = self.manifest.session_close(self.manifest.purchase_session) - timedelta(
-                        minutes=self.manifest.policy.option_cutoff_minutes
+                        minutes=self.manifest.execution.setup_cutoff_minutes
                     )
                     if self.now() >= deadline:
                         raise ValueError("Configured mandatory purchase window has already ended")
@@ -937,14 +970,34 @@ class TradingService:
                             raise ValueError("Corrective hedge has no permitted risk-reducing first slice")
                 else:
                     if (
-                        not self.manifest.can_trade(self.now(), "OPT")
+                        not self.manifest.can_trade(self.now(), "OPT", setup=True)
                         or self.now().astimezone(NY).date() != self.manifest.purchase_session
                     ):
                         raise ValueError(
                             "Setup only permitted during the configured purchase-session option order window"
                         )
+                    if self.now() < self.manifest.session_open(self.manifest.purchase_session) + timedelta(
+                        minutes=self.manifest.execution.setup_opening_wait_minutes
+                    ):
+                        raise ValueError(
+                            "Patient setup waits for the configured opening quote-stabilization period"
+                        )
                     snapshot = self.broker.snapshot()
-                    proposed = self._setup_quantities(snapshot, self.broker.quotes())
+                    plan = await asyncio.to_thread(
+                        self.setup_planner.plan,
+                        snapshot,
+                        dict(self.broker.quotes()),
+                        self.last_scenarios,
+                        self.now(),
+                    )
+                    if (
+                        self.broker.snapshot().quantities() != snapshot.quantities()
+                        or self.broker.snapshot().orders
+                    ):
+                        raise ValueError("Inventory/orders changed during setup planning; reconcile")
+                    self.setup_pairs = plan["pairs"]
+                    self.setup_target = plan["target"]
+                    proposed = dict(self.setup_target.quantities)
                     preflight = self.gate.validate(
                         snapshot,
                         self.broker.quotes(),
@@ -956,14 +1009,28 @@ class TradingService:
                     if not preflight.passed:
                         raise ValueError("Mandatory portfolio preflight: " + "; ".join(preflight.reasons))
                     self.setup_target_quantities = dict(proposed)
+                    self.setup_decision_id = self.store.record(
+                        "decision",
+                        snapshot.account,
+                        {
+                            **self.setup_target.model_dump(mode="json"),
+                            "profile": "PROTECTED_DAY0",
+                            "pairs": self.setup_pairs,
+                            "at": self.now().isoformat(),
+                            "risk_passed": True,
+                        },
+                    )
                     self.store.record(
                         "setup_plan",
                         snapshot.account,
                         {
                             "quantities": proposed,
+                            "pairs": self.setup_pairs,
+                            "acquisition_path": plan["acquisition_path"],
+                            "scenario_id": self.last_scenarios.identifier,
                             "snapshot_id": snapshot.version,
                             "config_hash": self.manifest.config_hash,
-                            "explanation": "Freeze initial delta hedge during mandatory construction; risk rechecked on each slice",
+                            "explanation": "Complete mandatory + protective option + residual stock plan; guaranteed paired acquisitions only",
                         },
                     )
                 self.broker.readonly = False
@@ -1038,6 +1105,9 @@ class TradingService:
                 "setup": {
                     "armed": self.setup_armed,
                     "auto_hedge": self.auto_hedge_after_setup,
+                    "plan": self.setup_target_quantities,
+                    "pairs": self.setup_pairs,
+                    "opening_wait_minutes": self.manifest.execution.setup_opening_wait_minutes,
                     "complete": bool(snap) and not self.gate.registry.check(snap.quantities()),
                     "holdings": [
                         {
@@ -1054,7 +1124,7 @@ class TradingService:
                     "baseline_recorded": self.manifest.day_zero in self.ledger.closes(),
                     "on_day_zero": self.now().astimezone(NY).date() == self.manifest.day_zero,
                     "window_open": self.now().astimezone(NY).date() == self.manifest.purchase_session
-                    and self.manifest.can_trade(self.now(), "OPT"),
+                    and self.manifest.can_trade(self.now(), "OPT", setup=True),
                 },
                 "mode": self.mode,
                 "ready": self.ready,
@@ -1092,6 +1162,8 @@ class TradingService:
                 "positions": positions,
                 "orders": self.store.intents(self.manifest.account),
                 "fills": self.store.fills(self.manifest.account),
+                "package_executions": self.store.records("package_execution", self.manifest.account, 100),
+                "package_commissions": self.store.records("package_commission", self.manifest.account, 100),
                 "transitions": self.store.records("order_transition", self.manifest.account, 100),
                 "decisions": self.store.records("decision", self.manifest.account, 30),
                 "alerts": self.store.records("alert", self.manifest.account, 30),
@@ -1130,6 +1202,7 @@ class TradingService:
                 "config_hash": self.manifest.config_hash,
                 "contest_id": self.manifest.contest_id,
                 "policy": self.manifest.policy.model_dump(),
+                "execution_policy": self.manifest.execution.model_dump(),
                 "limits": self.manifest.risk.model_dump(),
                 "last_quote_at": max(
                     (q.observed_at.isoformat() for q in self.last_quotes.values()), default=None

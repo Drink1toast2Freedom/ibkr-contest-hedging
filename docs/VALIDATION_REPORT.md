@@ -332,3 +332,31 @@ and dashboard controls. Regressions cover missing-versus-measured scores,
 nonfinite/non-numeric/negative metrics, evidence-change cache invalidation,
 missing files, disabled controls and escaped diagnostic text. Ordinary paper
 hedging and shadow recovery remain independently controlled.
+
+## Urgency-aware orders and protected setup
+
+The October 7 opening-price and October 8 small-order audits motivated an
+execution-policy update. Normal orders use patient, tick-valid limits with staged
+repricing and a fixed arrival budget; urgent stock risk corrections can use market
+orders only with a live <=1-second, deep, <=$0.02-spread book. Modeled slippage and
+fresh risk checks remain enforced; market orders do not have a hard price ceiling.
+Wide option spreads wait rather than force a fill. Ordinary stock slices need
+$1,000 notional and independent after-cost/uncertainty improvement; fee-only
+apparent score improvement is rejected. Default slice maximums and hard portfolio
+limits are unchanged.
+
+Future Day 0 setup first records a complete portfolio and a feasible balanced
+acquisition path. Planned stock hedges are prepared, then each mandatory option
+is acquired with a matched nonmandatory option through a guaranteed pair limit
+order. No bare-mandatory API fallback exists. Parent and both leg intents are
+atomic in storage; cancellation races, duplicate reports, unknown transmission,
+working-leg exposure and restart uncertainty remain auditable. Unsupported
+mandates/routes wait without purchasing. Recorded target performance is modeled;
+no historical contest-score improvement is claimed for these new defaults.
+
+On October 8, read-only IBKR what-if requests accepted BA 195C/197.5C and
+195P/192.5P guaranteed pairs without warnings. This validates order construction
+and preview support, not actual package-fill behavior. A future paper Day 0 still
+needs forward execution verification. See PROTECTED_SETUP_EXECUTION.md.
+
+Final verification for this update: **180 passed, zero failures and skips**, including isolated PostgreSQL and JavaScript controls (49.36 seconds). Ruff and diff checks passed. Actual package fills remain a forward paper-test item; no current practice holdings were changed during validation.

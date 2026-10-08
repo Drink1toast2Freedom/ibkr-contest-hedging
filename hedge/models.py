@@ -163,6 +163,19 @@ class OrderRequest(Frozen):
     account: str
     snapshot_id: str
     decision_id: str
+    order_type: Literal["LMT", "MKT"] = "LMT"
+    urgency: Literal["PATIENT", "NORMAL", "DEADLINE", "CORRECTIVE"] = "NORMAL"
+
+
+class SetupPackageRequest(Frozen):
+    package_id: str
+    buy_id: int
+    sell_id: int
+    quantity: int = Field(gt=0)
+    limit_price: Decimal = Field(gt=0)
+    account: str
+    snapshot_id: str
+    decision_id: str
 
 
 class Execution(Frozen):

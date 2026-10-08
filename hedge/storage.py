@@ -199,7 +199,194 @@ class Store:
             if pending_only:
                 query = query.where(Intent.state.not_in(TERMINAL))
             rows = session.scalars(query).all()
-            return [{c.name: getattr(r, c.name) for c in Intent.__table__.columns} for r in rows]
+            plans = session.scalars(
+                select(Record).where(Record.category == "execution_plan", Record.account == account)
+            ).all()
+            metadata = {r.payload["intent_id"]: r.payload for r in plans}
+            packages = {
+                r.id: r.payload
+                for r in session.scalars(
+                    select(Record).where(Record.category == "setup_package", Record.account == account)
+                ).all()
+            }
+            for meta in metadata.values():
+                if meta.get("package_id") in packages:
+                    meta = {**meta, "net_limit": packages[meta["package_id"]]["limit_price"]}
+                    metadata[meta["intent_id"]] = meta
+            return [
+                {
+                    **{c.name: getattr(r, c.name) for c in Intent.__table__.columns},
+                    **{
+                        k: v
+                        for k, v in metadata.get(r.id, {}).items()
+                        if k in ("order_type", "urgency", "initial_limit", "package_id", "net_limit")
+                    },
+                }
+                for r in rows
+            ]
+
+    def get_record(self, identifier, account, category):
+        with self.sessions() as session:
+            row = session.get(Record, identifier)
+            if row is None or row.account != account or row.category != category:
+                return None
+            return row.payload
+
+    def execution_plan(self, identifier, account):
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(Record).where(Record.category == "execution_plan", Record.account == account)
+            ).all()
+            return next((r.payload for r in rows if r.payload.get("intent_id") == identifier), None)
+
+    def update_package_price(self, identifier, account, price):
+        with self.transaction() as session:
+            row = session.get(Record, identifier)
+            if row is None or row.category != "setup_package" or row.account != account:
+                raise ValueError("Unknown protected package")
+            row.payload = {**row.payload, "limit_price": str(price)}
+
+    def amend_limit(self, identifier, price, reason):
+        with self.transaction() as session:
+            row = session.get(Intent, identifier)
+            if row is None or row.state not in ("ACKNOWLEDGED", "PARTIALLY_FILLED"):
+                raise ValueError("Only acknowledged orders can amend their limit")
+            old = str(row.limit_price)
+            row.limit_price = Decimal(str(price))
+            row.updated_at = self.now()
+            session.add(
+                Record(
+                    id=uuid4().hex,
+                    category="price_amendment",
+                    account=row.account,
+                    at=self.now(),
+                    payload={"intent_id": identifier, "old": old, "new": str(price), **payload(reason)},
+                )
+            )
+
+    def prepare_request(self, request, policy):
+        with self.transaction() as session:
+            row = session.get(Intent, request.intent_id)
+            if row is None or row.state != "VALIDATED":
+                raise ValueError("Only an unsent validated intent may refresh its price")
+            row.limit_price = request.limit_price
+            plans = session.scalars(
+                select(Record).where(Record.category == "execution_plan", Record.account == request.account)
+            ).all()
+            for plan in plans:
+                if plan.payload.get("intent_id") == request.intent_id:
+                    plan.payload = {
+                        **plan.payload,
+                        "order_type": request.order_type,
+                        "urgency": request.urgency,
+                    }
+                    break
+            session.add(
+                Record(
+                    id=uuid4().hex,
+                    category="pretransmission",
+                    account=request.account,
+                    at=self.now(),
+                    payload={
+                        "intent_id": request.intent_id,
+                        "request": payload(request),
+                        "quote": policy["quote"],
+                    },
+                )
+            )
+
+    def observe_limit(self, identifier, price):
+        """Update displayed price from a broker observation, including old intents."""
+        price = Decimal(str(price))
+        if not price.is_finite() or price <= 0:
+            return
+        with self.transaction() as session:
+            row = session.get(Intent, identifier)
+            if row is None or row.limit_price == price:
+                return
+            plans = session.scalars(
+                select(Record).where(Record.category == "execution_plan", Record.account == row.account)
+            ).all()
+            if not any(p.payload.get("intent_id") == identifier for p in plans):
+                session.add(
+                    Record(
+                        id=uuid4().hex,
+                        category="execution_plan",
+                        account=row.account,
+                        at=self.now(),
+                        payload={
+                            "intent_id": identifier,
+                            "initial_limit": str(row.limit_price),
+                            "order_type": "LMT",
+                            "urgency": "LEGACY",
+                        },
+                    )
+                )
+            session.add(
+                Record(
+                    id=uuid4().hex,
+                    category="broker_price_observation",
+                    account=row.account,
+                    at=self.now(),
+                    payload={
+                        "intent_id": identifier,
+                        "old": str(row.limit_price),
+                        "confirmed_limit": str(price),
+                    },
+                )
+            )
+            row.limit_price = price
+
+    def create_package(self, request, quotes):
+        """One transaction persists both legs and their common transmission identity."""
+        with self.transaction() as session:
+            if session.get(Record, request.package_id):
+                raise ValueError("Duplicate package identity")
+            a, b = quotes[request.buy_id], quotes[request.sell_id]
+            cap = a.mid - b.mid + (a.ask - a.bid + b.ask - b.bid) * 0.6
+            session.add(
+                Record(
+                    id=request.package_id,
+                    category="setup_package",
+                    account=request.account,
+                    at=self.now(),
+                    payload={**payload(request), "price_cap": cap},
+                )
+            )
+            for i, sign in [(request.buy_id, 1), (request.sell_id, -1)]:
+                identifier = f"{request.package_id}:{i}"
+                price = Decimal(str(quotes[i].mid))
+                session.add(
+                    Intent(
+                        id=identifier,
+                        account=request.account,
+                        con_id=i,
+                        signed_quantity=sign * request.quantity,
+                        limit_price=price,
+                        decision_id=request.decision_id,
+                        snapshot_id=request.snapshot_id,
+                        state="CREATED",
+                        created_at=self.now(),
+                        updated_at=self.now(),
+                    )
+                )
+                session.add(
+                    Record(
+                        id=uuid4().hex,
+                        category="execution_plan",
+                        account=request.account,
+                        at=self.now(),
+                        payload={
+                            "intent_id": identifier,
+                            "order_type": "COMBO_LMT",
+                            "urgency": "PATIENT",
+                            "initial_limit": str(price),
+                            "package_id": request.package_id,
+                            "net_limit": str(request.limit_price),
+                            "quote": payload(quotes[i]),
+                        },
+                    )
+                )
 
     def execution(self, execution: Execution):
         key = f"{execution.account}:{execution.exec_id}"

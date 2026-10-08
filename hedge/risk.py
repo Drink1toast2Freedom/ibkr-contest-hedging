@@ -167,7 +167,7 @@ class RiskGate:
                 if c.kind == "STK" and quantities.get(i, 0) < min(0, actual.get(i, 0)):
                     if q.shortable_shares is None or abs(quantities[i]) > q.shortable_shares:
                         reasons.append(f"Stock borrow unavailable/insufficient: {i}")
-                if not self.manifest.can_trade(now, c.kind):
+                if not self.manifest.can_trade(now, c.kind, setup=day_zero):
                     reasons.append(f"Outside permitted order window: {i}")
                 if quantities.get(i, 0) > actual.get(i, 0) and q.ask_size < 1:
                     reasons.append(f"No ask liquidity: {i}")

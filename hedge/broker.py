@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Protocol
 
-from ib_async import IB, ExecutionFilter, LimitOrder
+from ib_async import IB, ComboLeg, ExecutionFilter, LimitOrder, MarketOrder, TagValue
 from ib_async import Contract as IBContract
 
 from .models import Execution, PortfolioSnapshot, Position, Quote, WorkingOrder, utcnow
@@ -94,6 +94,19 @@ class IBKRBroker:
         e = fill.execution
         if e.acctNumber != self.manifest.account:
             return
+        if fill.contract.secType == "BAG":
+            self.emit(
+                "package_execution",
+                {
+                    "exec_id": e.execId,
+                    "order_ref": e.orderRef,
+                    "perm_id": e.permId,
+                    "quantity": str(e.shares),
+                    "net_price": str(e.price),
+                    "at": fill.time.isoformat(),
+                },
+            )
+            return  # Aggregate combo report is not an additional asset/fill.
         if not float(e.shares).is_integer():
             self.emit("unsupported_execution", {"exec_id": e.execId, "shares": str(e.shares)})
             return
@@ -120,6 +133,17 @@ class IBKRBroker:
 
     def _commission(self, trade, fill, report):
         if fill.execution.acctNumber == self.manifest.account and finite(report.commission):
+            if fill.contract.secType == "BAG":
+                self.emit(
+                    "package_commission",
+                    {
+                        "exec_id": report.execId,
+                        "order_ref": fill.execution.orderRef,
+                        "amount": str(report.commission),
+                        "currency": report.currency,
+                    },
+                )
+                return  # Retain aggregate evidence without charging leg NAV twice.
             self.emit(
                 "commission",
                 {"exec_id": report.execId, "amount": str(report.commission), "currency": report.currency},
@@ -136,6 +160,8 @@ class IBKRBroker:
                     "status": trade.orderStatus.status,
                     "filled": trade.orderStatus.filled,
                     "remaining": trade.orderStatus.remaining,
+                    "order_type": trade.order.orderType,
+                    "limit_price": trade.order.lmtPrice,
                 },
             )
 
@@ -333,6 +359,24 @@ class IBKRBroker:
                 remaining = t.orderStatus.remaining
                 if not finite(remaining) or not float(remaining).is_integer():
                     raise ValueError("Unknown/fractional remaining order quantity")
+                if t.contract.secType == "BAG":
+                    if not t.order.orderRef.startswith("hedge-package:"):
+                        raise ValueError("Unknown working combo requires reconciliation")
+                    for leg in t.contract.comboLegs:
+                        orders.append(
+                            WorkingOrder(
+                                order_id=t.order.orderId,
+                                perm_id=t.order.permId,
+                                con_id=leg.conId,
+                                signed_remaining=int(remaining)
+                                * leg.ratio
+                                * (1 if leg.action == "BUY" else -1)
+                                * (1 if t.order.action == "BUY" else -1),
+                                order_ref=t.order.orderRef,
+                                status=t.orderStatus.status,
+                            )
+                        )
+                    continue
                 orders.append(
                     WorkingOrder(
                         order_id=t.order.orderId,
@@ -449,10 +493,29 @@ class IBKRBroker:
             raise ValueError("Paper account identity rejected")
         if request.con_id not in self.manifest.allowlist:
             raise ValueError("Discretionary trading of mandatory/unapproved instruments is forbidden")
-        order = LimitOrder(
+        if request.order_type == "MKT":
+            from .order_policy import choose_order
+
+            q = self.quotes().get(request.con_id)
+            if (
+                q is None
+                or request.urgency != "CORRECTIVE"
+                or choose_order(
+                    self.manifest,
+                    self,
+                    self.manifest.contract_map[request.con_id],
+                    q,
+                    request.signed_quantity,
+                    utcnow(),
+                    corrective=True,
+                )["order_type"]
+                != "MKT"
+            ):
+                raise ValueError("Market order urgency/liquidity/freshness rejected")
+        order = (MarketOrder if request.order_type == "MKT" else LimitOrder)(
             "BUY" if request.signed_quantity > 0 else "SELL",
             abs(request.signed_quantity),
-            float(request.limit_price),
+            *([] if request.order_type == "MKT" else [float(request.limit_price)]),
             orderId=order_id,
             account=request.account,
             orderRef="hedge:" + request.intent_id,
@@ -462,40 +525,77 @@ class IBKRBroker:
         trade = self.ib.placeOrder(self.native[request.con_id], order)
         return {"order_id": trade.order.orderId, "perm_id": trade.order.permId}
 
-    async def setup_mandate(self, request, order_id, now):
-        if request.account != self.manifest.account or not request.account.startswith("DU"):
-            raise ValueError("Paper account identity rejected")
+    def package_contract(self, request):
+        c, h = (self.manifest.contract_map[i] for i in (request.buy_id, request.sell_id))
         if (
-            now.astimezone(__import__("zoneinfo").ZoneInfo("America/New_York")).date()
-            != self.manifest.purchase_session
+            request.buy_id not in self.manifest.mandatory
+            or request.sell_id not in self.manifest.allowlist
+            or c.kind != "OPT"
+            or h.kind != "OPT"
+            or c.currency != "USD"
+            or h.currency != "USD"
+            or c.multiplier != 100
+            or h.multiplier != 100
+            or c.expiry != h.expiry
+            or c.underlying_id != h.underlying_id
+            or c.right != h.right
+            or c.trading_class != h.trading_class
+            or not (h.strike > c.strike if c.right == "C" else h.strike < c.strike)
+            or request.buy_id not in self.native
+            or request.sell_id not in self.native
         ):
-            raise ValueError("Mandatory purchases are only allowed on the configured purchase session")
-        if request.con_id not in self.manifest.mandatory or request.signed_quantity <= 0:
-            raise ValueError("Invalid mandatory purchase")
-        quantity = self.snapshot().projected().get(request.con_id, 0)
-        if quantity + request.signed_quantity > self.manifest.mandatory[request.con_id]:
-            raise ValueError("Mandatory purchase would exceed exact quantity")
-        if self.readonly or not self.qualified or not self.reconciled or not self.ib.isConnected():
-            raise ValueError("Broker not ready")
-        order = LimitOrder(
+            raise ValueError("Unsupported/unqualified guaranteed protective option pair")
+        return IBContract(
+            symbol=c.symbol,
+            secType="BAG",
+            currency="USD",
+            exchange="SMART",
+            comboLegs=[
+                ComboLeg(conId=request.buy_id, ratio=1, action="BUY", exchange="SMART"),
+                ComboLeg(conId=request.sell_id, ratio=1, action="SELL", exchange="SMART"),
+            ],
+        )
+
+    def package_order(self, request, order_id=0):
+        return LimitOrder(
             "BUY",
-            request.signed_quantity,
+            request.quantity,
             float(request.limit_price),
             orderId=order_id,
             account=request.account,
-            orderRef="hedge:" + request.intent_id,
+            orderRef="hedge-package:" + request.package_id,
             tif="DAY",
             outsideRth=False,
+            smartComboRoutingParams=[TagValue("NonGuaranteed", "0")],
         )
-        trade = self.ib.placeOrder(self.native[request.con_id], order)
+
+    async def package_preview(self, request):
+        return await self.ib.whatIfOrderAsync(self.package_contract(request), self.package_order(request))
+
+    async def submit_package(self, request, order_id, now):
+        if self.readonly or not self.qualified or not self.reconciled or not self.ib.isConnected():
+            raise ValueError("Paper broker not ready for protected setup")
+        if (
+            request.account != self.manifest.account
+            or now.astimezone(__import__("zoneinfo").ZoneInfo("America/New_York")).date()
+            != self.manifest.purchase_session
+        ):
+            raise ValueError("Wrong paper account or setup session")
+        projected = self.snapshot().projected()
+        if projected.get(request.buy_id, 0) + request.quantity > self.manifest.mandatory[request.buy_id]:
+            raise ValueError("Protected package exceeds exact mandate")
+        trade = self.ib.placeOrder(self.package_contract(request), self.package_order(request, order_id))
         return {"order_id": trade.order.orderId, "perm_id": trade.order.permId}
+
+    async def setup_mandate(self, request, order_id, now):
+        raise ValueError("Bare mandatory purchases disabled; use a guaranteed protective package")
 
     async def cancel(self, order_id):
         for t in self.ib.openTrades():
             if (
                 t.order.orderId == order_id
                 and t.order.account == self.manifest.account
-                and t.order.orderRef.startswith("hedge:")
+                and t.order.orderRef.startswith(("hedge:", "hedge-package:"))
             ):
                 self.ib.cancelOrder(t.order)
                 return
@@ -507,7 +607,7 @@ class IBKRBroker:
             if (
                 t.order.orderId == order_id
                 and t.order.account == self.manifest.account
-                and t.order.orderRef.startswith("hedge:")
+                and t.order.orderRef.startswith(("hedge:", "hedge-package:"))
             ):
                 t.order.lmtPrice = float(limit_price)
                 self.ib.placeOrder(t.contract, t.order)
@@ -515,10 +615,10 @@ class IBKRBroker:
         raise ValueError("Cannot replace absent system order")
 
     async def margin_preview(self, request):
-        order = LimitOrder(
+        order = (MarketOrder if request.order_type == "MKT" else LimitOrder)(
             "BUY" if request.signed_quantity > 0 else "SELL",
             abs(request.signed_quantity),
-            float(request.limit_price),
+            *([] if request.order_type == "MKT" else [float(request.limit_price)]),
             account=request.account,
             tif="DAY",
             outsideRth=False,
@@ -568,6 +668,8 @@ class SimBroker:
         self.qualified = True
         self.readonly = True
         self.orders = {}
+        self.package_orders = {}
+        self.requests = {}
         self._quotes = {}
         self._counter = 1000
 
@@ -601,7 +703,7 @@ class SimBroker:
             excess_liquidity=self.nav * Decimal(".8"),
             initial_margin=self.nav * Decimal(".2"),
             positions=tuple(Position(con_id=i, quantity=q) for i, q in sorted(self.positions.items()) if q),
-            orders=tuple(self.orders.values()),
+            orders=tuple(leg for o in self.orders.values() for leg in (o if isinstance(o, tuple) else (o,))),
             connected=self.connected,
             reconciled=self.reconciled,
             source="synthetic",
@@ -644,6 +746,7 @@ class SimBroker:
     async def submit(self, request, order_id):
         if self.readonly or not self.connected:
             raise ValueError("Synthetic broker is read-only/disconnected")
+        self.requests[order_id] = request
         self.orders[order_id] = WorkingOrder(
             order_id=order_id,
             con_id=request.con_id,
@@ -665,6 +768,71 @@ class SimBroker:
         return {"order_id": order_id, "perm_id": order_id}
 
     async def fill(self, order_id, quantity=None):
+        if order_id in self.package_orders:
+            request = self.package_orders[order_id]
+            amount = request.quantity if quantity is None else int(quantity)
+            if not 0 < amount <= request.quantity:
+                raise ValueError("Protected package overfill")
+            prices = {
+                request.buy_id: Decimal(str(self._quotes[request.buy_id].mid)),
+                request.sell_id: Decimal(str(self._quotes[request.buy_id].mid)) - request.limit_price,
+            }
+            if any(
+                not self._quotes[i].bid <= float(price) <= self._quotes[i].ask for i, price in prices.items()
+            ):
+                return
+            self._counter += 1
+            # Synthetic atomic ratio fills: both positions update before any event.
+            for i, sign in [(request.buy_id, 1), (request.sell_id, -1)]:
+                q = self._quotes[i]
+                price = prices[i]
+                fee = max(
+                    self.manifest.policy.minimum_commission, amount * self.manifest.policy.commission_option
+                )
+                self.positions[i] = self.positions.get(i, 0) + sign * amount
+                self.cash -= price * sign * amount * 100 + Decimal(str(fee))
+                self.nav -= (price - Decimal(str(q.mid))) * sign * amount * 100 + Decimal(str(fee))
+                execution = Execution(
+                    exec_id=f"SIM.PACKAGE.{order_id}.{i}.{self._counter}.{self.now.timestamp()}",
+                    order_id=order_id,
+                    perm_id=order_id,
+                    account=self.manifest.account,
+                    con_id=i,
+                    signed_quantity=sign * amount,
+                    price=price,
+                    at=self.now,
+                    order_ref="hedge-package:" + request.package_id,
+                )
+                self.events.put_nowait(("execution", execution))
+                self.events.put_nowait(
+                    ("commission", {"exec_id": execution.exec_id, "amount": str(fee), "currency": "USD"})
+                )
+            remaining = request.quantity - amount
+            if remaining:
+                self.package_orders[order_id] = request.model_copy(update={"quantity": remaining})
+                self.orders[order_id] = tuple(
+                    o.model_copy(
+                        update={"signed_remaining": remaining * (1 if o.con_id == request.buy_id else -1)}
+                    )
+                    for o in self.orders[order_id]
+                )
+            else:
+                del self.orders[order_id]
+                del self.package_orders[order_id]
+            self.events.put_nowait(
+                (
+                    "order",
+                    {
+                        "order_id": order_id,
+                        "perm_id": order_id,
+                        "order_ref": "hedge-package:" + request.package_id,
+                        "status": "Submitted" if remaining else "Filled",
+                        "remaining": remaining,
+                        "filled": amount,
+                    },
+                )
+            )
+            return
         order = self.orders[order_id]
         signed = (
             order.signed_remaining
@@ -675,6 +843,16 @@ class SimBroker:
             raise ValueError("Overfill")
         quote = self._quotes[order.con_id]
         price = Decimal(str(quote.ask if signed > 0 else quote.bid))
+        request = self.requests.get(order_id)
+        if request is not None and request.order_type == "LMT":
+            if (
+                signed > 0
+                and float(request.limit_price) < quote.bid
+                or signed < 0
+                and float(request.limit_price) > quote.ask
+            ):
+                return
+            price = min(price, request.limit_price) if signed > 0 else max(price, request.limit_price)
         c = self.manifest.contract_map[order.con_id]
         fee = max(
             self.manifest.policy.minimum_commission,
@@ -686,7 +864,7 @@ class SimBroker:
             ),
         )
         self.cash -= price * signed * c.multiplier + Decimal(str(fee))
-        self.nav -= Decimal(str(abs(signed) * (quote.ask - quote.bid) / 2 * c.multiplier + fee))
+        self.nav -= (price - Decimal(str(quote.mid))) * signed * c.multiplier + Decimal(str(fee))
         self.positions[order.con_id] = self.positions.get(order.con_id, 0) + signed
         remaining = order.signed_remaining - signed
         if remaining:
@@ -721,22 +899,53 @@ class SimBroker:
         )
 
     async def setup_mandate(self, request, order_id, now):
-        from .config import NY
+        raise ValueError("Bare mandatory purchases disabled; use a guaranteed protective package")
 
+    async def submit_package(self, request, order_id, now):
+        if self.readonly or not self.connected or request.account != self.manifest.account:
+            raise ValueError("Synthetic protected setup unavailable")
         if (
-            request.account != self.manifest.account
-            or now.astimezone(NY).date() != self.manifest.purchase_session
+            now.astimezone(__import__("zoneinfo").ZoneInfo("America/New_York")).date()
+            != self.manifest.purchase_session
         ):
-            raise ValueError("Wrong account or outside configured purchase session")
-        required = self.manifest.mandatory.get(request.con_id)
-        current = self.snapshot().projected().get(request.con_id, 0)
-        if required is None or not 0 <= current < current + request.signed_quantity <= required:
-            raise ValueError("Day 0 may only buy missing mandatory quantity")
-        return await self.submit(request, order_id)
+            raise ValueError("Outside purchase session")
+        if (
+            self.snapshot().projected().get(request.buy_id, 0) + request.quantity
+            > self.manifest.mandatory[request.buy_id]
+        ):
+            raise ValueError("Protected package exceeds exact mandate")
+        self.package_orders[order_id] = request
+        self.orders[order_id] = tuple(
+            WorkingOrder(
+                order_id=order_id,
+                perm_id=order_id,
+                con_id=i,
+                signed_remaining=sign * request.quantity,
+                order_ref="hedge-package:" + request.package_id,
+            )
+            for i, sign in [(request.buy_id, 1), (request.sell_id, -1)]
+        )
+        self.events.put_nowait(
+            (
+                "order",
+                {
+                    "order_id": order_id,
+                    "perm_id": order_id,
+                    "order_ref": "hedge-package:" + request.package_id,
+                    "status": "Submitted",
+                    "remaining": request.quantity,
+                    "filled": 0,
+                },
+            )
+        )
+        return {"order_id": order_id, "perm_id": order_id}
 
     async def cancel(self, order_id):
         order = self.orders.pop(order_id, None)
+        self.package_orders.pop(order_id, None)
         if order:
+            if isinstance(order, tuple):
+                order = order[0]
             self.events.put_nowait(
                 (
                     "order",
@@ -753,6 +962,14 @@ class SimBroker:
     async def replace(self, order_id, limit_price):
         if order_id not in self.orders:
             raise ValueError("Unknown order")
+        if order_id in self.package_orders:
+            self.package_orders[order_id] = self.package_orders[order_id].model_copy(
+                update={"limit_price": Decimal(str(limit_price))}
+            )
+        elif order_id in self.requests:
+            self.requests[order_id] = self.requests[order_id].model_copy(
+                update={"limit_price": Decimal(str(limit_price))}
+            )
 
     async def disconnect(self):
         self.connected = self.reconciled = False

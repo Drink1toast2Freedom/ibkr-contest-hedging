@@ -67,6 +67,30 @@ class ClosingCapturePolicy(Frozen):
     retry_seconds: int = Field(default=15, ge=5, le=60)
 
 
+class ExecutionPolicy(Frozen):
+    stock_slice: int = Field(default=100, ge=1, le=1000)
+    option_slice: int = Field(default=1, ge=1, le=10)
+    minimum_stock_notional: float = Field(default=1000, ge=0)
+    minimum_slice_improvement: float = Field(default=1, ge=0)
+    stock_spread_absolute: float = Field(default=0.20, gt=0)
+    stock_spread_relative: float = Field(default=0.002, gt=0, le=0.05)
+    option_spread_absolute: float = Field(default=0.50, gt=0)
+    option_spread_relative: float = Field(default=0.15, gt=0, le=0.50)
+    stock_wait_seconds: int = Field(default=15, ge=5, le=120)
+    option_wait_seconds: int = Field(default=60, ge=10, le=300)
+    setup_wait_seconds: int = Field(default=120, ge=30, le=600)
+    stock_lifetime_seconds: int = Field(default=60, ge=30, le=300)
+    option_lifetime_seconds: int = Field(default=180, ge=60, le=900)
+    setup_lifetime_seconds: int = Field(default=300, ge=120, le=1800)
+    setup_opening_wait_minutes: int = Field(default=5, ge=0, le=60)
+    setup_cutoff_minutes: int = Field(default=1, ge=1, le=30)
+    urgent_market_stocks: bool = True
+    market_quote_age: float = Field(default=1, gt=0, le=2)
+    market_spread_absolute: float = Field(default=0.02, gt=0, le=0.05)
+    market_depth_multiple: int = Field(default=5, ge=2)
+    market_slippage_bps: float = Field(default=5, gt=0, le=20)
+
+
 class Manifest(Frozen):
     name: str
     account: str
@@ -86,6 +110,7 @@ class Manifest(Frozen):
     market_data_provider: Literal["ibkr", "moomoo"] = "ibkr"
     daily_stock_history: str | None = None
     closing_capture: ClosingCapturePolicy = ClosingCapturePolicy()
+    execution: ExecutionPolicy = ExecutionPolicy()
     recovery: dict = Field(default_factory=dict)
     initial_nav: Decimal = Field(default=Decimal("1000000"), gt=0)
     contracts: tuple[Contract, ...]
@@ -192,11 +217,17 @@ class Manifest(Frozen):
             (self.session_close(d) for d in self.scoring_sessions if self.session_close(d) > now), None
         )
 
-    def can_trade(self, now: datetime, kind: str) -> bool:
+    def can_trade(self, now: datetime, kind: str, setup: bool = False) -> bool:
         day = self.active_session(now)
         if day is None:
             return False
-        cutoff = self.policy.option_cutoff_minutes if kind == "OPT" else self.policy.stock_cutoff_minutes
+        cutoff = (
+            self.execution.setup_cutoff_minutes
+            if setup
+            else self.policy.option_cutoff_minutes
+            if kind == "OPT"
+            else self.policy.stock_cutoff_minutes
+        )
         return self.session_open(day) <= now < self.session_close(day) - timedelta(minutes=cutoff)
 
     @property

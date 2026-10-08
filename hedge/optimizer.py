@@ -8,6 +8,7 @@ import numpy as np
 from .cashflows import cash_carry
 from .config import NY
 from .models import Target
+from .order_policy import spread_error
 
 
 def execution_cost(manifest, quotes, identifiers, delta):
@@ -18,7 +19,13 @@ def execution_cost(manifest, quotes, identifiers, delta):
             continue
         c, q = manifest.contract_map[i], quotes[i]
         available = q.ask_size if d > 0 else q.bid_size
-        size = max(1, min(1 if c.kind == "OPT" else 100, available))
+        size = max(
+            1,
+            min(
+                manifest.execution.option_slice if c.kind == "OPT" else manifest.execution.stock_slice,
+                available,
+            ),
+        )
         rate = manifest.policy.commission_option if c.kind == "OPT" else manifest.policy.commission_share
         # All full slices have the same modeled fee; final partial slice is
         # conservatively charged a full slice. Actual fees always come from IBKR.
@@ -33,7 +40,9 @@ class HedgeOptimizer:
         self.manifest = manifest
         self.baseline_nav = float(manifest.initial_nav)
 
-    def evaluate_target(self, snapshot, quotes, scenarios, target, previous_nav, nav_estimate):
+    def evaluate_target(
+        self, snapshot, quotes, scenarios, target, previous_nav, nav_estimate, include_costs=True
+    ):
         """Revalidate a remaining execution plan against fresh marks and paid costs."""
         m = self.manifest
         actual = snapshot.quantities()
@@ -41,7 +50,7 @@ class HedgeOptimizer:
         current = np.array([actual.get(i, 0) for i in ids])
         desired = np.array([target.quantities.get(i, 0) for i in ids])
         delta = desired - current
-        costs = execution_cost(m, quotes, ids, delta)
+        costs = execution_cost(m, quotes, ids, delta) if include_costs else 0
         days = scenarios.calendar_days
 
         def carry(quantities, cash):
@@ -121,6 +130,7 @@ class HedgeOptimizer:
             i
             for i in candidates
             if quotes[i].data_type == allowed_type
+            and not spread_error(m, m.contract_map[i], quotes[i])
             and -1
             <= (snapshot.at - quotes[i].observed_at).total_seconds()
             <= (m.risk.option_quote_age if m.contract_map[i].kind == "OPT" else m.risk.stock_quote_age)
@@ -174,11 +184,23 @@ class HedgeOptimizer:
             if m.contract_map[i].kind == "STK":
                 borrow_limit = quotes[i].shortable_shares or 0
                 constraints += [hneg[j] <= max(borrow_limit, max(0, -actual.get(i, 0)))]
+        from .risk import RiskEngine
+
+        correcting = not RiskEngine(m).evaluate(snapshot, quotes, scenarios, actual).passed
+        if not correcting:
+            for j, i in enumerate(candidates):
+                if m.contract_map[i].kind == "STK":
+                    minimum = max(1, int(np.ceil(m.execution.minimum_stock_notional / quotes[i].mid)))
+                    constraints += [buy[j] >= minimum * buying[j], sell[j] >= minimum * selling[j]]
         buy_sizes, sell_sizes, fees_buy, fees_sell, spread_cost = [], [], [], [], []
         for i in candidates:
             c, q = m.contract_map[i], quotes[i]
-            buy_size = max(1, min(1 if c.kind == "OPT" else 100, q.ask_size))
-            sell_size = max(1, min(1 if c.kind == "OPT" else 100, q.bid_size))
+            buy_size = max(
+                1, min(m.execution.option_slice if c.kind == "OPT" else m.execution.stock_slice, q.ask_size)
+            )
+            sell_size = max(
+                1, min(m.execution.option_slice if c.kind == "OPT" else m.execution.stock_slice, q.bid_size)
+            )
             rate = m.policy.commission_option if c.kind == "OPT" else m.policy.commission_share
             buy_sizes.append(buy_size)
             sell_sizes.append(sell_size)
