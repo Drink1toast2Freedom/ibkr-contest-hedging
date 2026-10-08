@@ -360,3 +360,38 @@ and preview support, not actual package-fill behavior. A future paper Day 0 stil
 needs forward execution verification. See PROTECTED_SETUP_EXECUTION.md.
 
 Final verification for this update: **180 passed, zero failures and skips**, including isolated PostgreSQL and JavaScript controls (49.36 seconds). Ruff and diff checks passed. Actual package fills remain a forward paper-test item; no current practice holdings were changed during validation.
+# Optimizer runtime verification — October 8, 2026
+
+- Final regression suite: **196 passed**, no failures or skips, **33.45 seconds**.
+  PostgreSQL integration used a newly created isolated database, removed after
+  the run. The operational ledger was not used for tests.
+- Ruff and diff checks passed. Dashboard tests include runtime rendering and
+  explicit incomplete-ranking feedback.
+- Sixteen new optimizer tests cover positive-part exactness, exact stress
+  dominance, asymmetric fees, brute-force integer objectives and cash carry,
+  failed-ranking retention, invalid bounds, total deadlines, objective offsets,
+  and incomplete next-close reporting. Earlier failures were test-fixture issues
+  and were corrected before the final full run.
+- Final expanded synthetic comparison: tracked `6b9d1fc` versus the updated model,
+  same configured 24 instruments, 14 options, 64 score scenarios and 770 stresses.
+  One sample per mode: stock-only **10.109 s / USER_LIMIT → 8.747 s / certified
+  primary target**; full **10.127 s / USER_LIMIT → 1.659 s / certified primary
+  target**, approximately **6.1 times faster**. Secondary ranking did not finish
+  in those two updated runs; no timeout solution was accepted.
+- A smaller BA-only synthetic comparison (three samples) previously measured
+  old stock median **77.697 ms** versus new **33.141 ms**. The final hierarchy
+  produced the same stock target and approximately 1.6-second full solves in
+  subsequent repeats. Load-sensitive timings are not universal latency promises.
+- Original score and hard limits remain. Primary selection uses a certified
+  lower-bound cap to preserve the existing $1 model-optimum band. Incomplete
+  optional ranking is explicit, rather than reported as fully optimized.
+- Application restarted only after verifying SHADOW mode and no active system
+  intents. The same PostgreSQL ledger and existing holdings were retained;
+  SHADOW mode was restored, and paper execution was not enabled.
+- Synthetic computation is not historical/forward contest-score evidence or
+  a measurement of IBKR fill latency. The surplus-reduction proposal remains
+  documentation only and was not activated by this update.
+
+Reproduction and model proofs: [Optimizer runtime](OPTIMIZER_RUNTIME.md).
+Local detailed results: `reports/validation/optimizer-runtime-expanded-final.json`
+and `reports/validation/optimizer-runtime-small-comparison.json`.

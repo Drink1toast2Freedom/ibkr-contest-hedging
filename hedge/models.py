@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -147,6 +147,7 @@ class Target(Frozen):
     estimated_cost: float = 0
     binding: tuple[str, ...] = ()
     explanation: str = ""
+    solver_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class RiskResult(Frozen):

@@ -35,6 +35,37 @@ def execution_cost(manifest, quotes, identifiers, delta):
     return float(cost)
 
 
+def _positive_part(expression, lower, upper, constraints):
+    """Exact max(expression, 0), with no binary when its sign is proved."""
+    if lower >= 0:
+        return expression
+    if upper <= 0:
+        return cp.Constant(0)
+    positive, negative = cp.Variable(nonneg=True), cp.Variable(nonneg=True)
+    sign = cp.Variable(boolean=True)
+    constraints.extend(
+        [
+            positive - negative == expression,
+            positive <= upper * sign,
+            negative <= -lower * (1 - sign),
+        ]
+    )
+    return positive
+
+
+def _stress_projection(stress, idx, fixed):
+    """Keep the strongest row for identical variable coefficients, exactly.
+
+    Frozen option IV/skew shocks often repeat the same stock coefficients.
+    Their lowest fixed portfolio value dominates every other row in that group.
+    No rounding, stress sampling, or approximate dominance is used.
+    """
+    matrix, inverse = np.unique(stress[:, idx], axis=0, return_inverse=True)
+    offset = np.full(len(matrix), np.inf)
+    np.minimum.at(offset, inverse, fixed)
+    return matrix, offset
+
+
 class HedgeOptimizer:
     def __init__(self, manifest):
         self.manifest = manifest
@@ -108,6 +139,42 @@ class HedgeOptimizer:
         recovery_stress=0.0025,
         recovery_gross=0.05,
     ):
+        started = monotonic()
+        metrics = {"stages": []}
+        result = self._solve(
+            snapshot,
+            quotes,
+            scenarios,
+            previous_nav,
+            nav_estimate,
+            stock_only,
+            strategy,
+            recovery_reference,
+            recovery_symbols,
+            recovery_stress,
+            recovery_gross,
+            metrics,
+            started + self.manifest.policy.solver_seconds,
+        )
+        metrics["total_ms"] = round((monotonic() - started) * 1000, 3)
+        return result.model_copy(update={"solver_metrics": metrics})
+
+    def _solve(
+        self,
+        snapshot,
+        quotes,
+        scenarios,
+        previous_nav,
+        nav_estimate,
+        stock_only,
+        strategy,
+        recovery_reference,
+        recovery_symbols,
+        recovery_stress,
+        recovery_gross,
+        metrics,
+        deadline,
+    ):
         m = self.manifest
         strategy = strategy or m.strategy
         actual = snapshot.quantities()
@@ -144,6 +211,7 @@ class HedgeOptimizer:
             )
         ]
         frozen = [i for i in ids if i not in candidates]
+        metrics["candidate_count"] = len(candidates)
         if not candidates:
             return self._unchanged(snapshot, scenarios, error, quotes, "NO_CANDIDATES")
         idx = [ids.index(i) for i in candidates]
@@ -157,24 +225,73 @@ class HedgeOptimizer:
                 for i in candidates
             ]
         )
-        trade_bounds = bounds + np.abs(current)
-        hpos, hneg = cp.Variable(n, integer=True), cp.Variable(n, integer=True)
-        sign, selected = cp.Variable(n, boolean=True), cp.Variable(n, boolean=True)
-        h, ah = hpos - hneg, hpos + hneg
-        buy, sell = cp.Variable(n, integer=True), cp.Variable(n, integer=True)
-        buying, selling = cp.Variable(n, boolean=True), cp.Variable(n, boolean=True)
-        buy_count, sell_count = cp.Variable(n, integer=True), cp.Variable(n, integer=True)
+        lower, upper = -bounds.copy(), bounds.copy()
+        for j, i in enumerate(candidates):
+            c, q = m.contract_map[i], quotes[i]
+            if c.kind != "STK":
+                continue
+            lower[j] = max(lower[j], -max(q.shortable_shares or 0, max(0, -actual.get(i, 0))))
+            # A symbol with one variable stock and no variable options has an
+            # exact affine delta interval. Use its implied integer bounds.
+            same_symbol = [k for k in candidates if m.contract_map[k].symbol == c.symbol]
+            coefficient = q.delta * q.spot
+            if same_symbol == [i] and coefficient:
+                fixed_delta = sum(
+                    quotes[k].delta * quotes[k].spot * m.contract_map[k].multiplier * actual.get(k, 0)
+                    for k in frozen
+                    if m.contract_map[k].symbol == c.symbol
+                )
+                endpoints = sorted(
+                    (
+                        (-m.risk.residual_delta * budget - fixed_delta) / coefficient,
+                        (m.risk.residual_delta * budget - fixed_delta) / coefficient,
+                    )
+                )
+                lower[j] = max(lower[j], np.ceil(endpoints[0] - 1e-9))
+                upper[j] = min(upper[j], np.floor(endpoints[1] + 1e-9))
+        if np.any(lower > upper):
+            return self._unchanged(snapshot, scenarios, error, quotes, "INFEASIBLE")
+        buy_bounds, sell_bounds = np.maximum(upper - current, 0), np.maximum(current - lower, 0)
+        # Only net holdings need integer domains. Exact sign/direction gates
+        # imply integrality of the positive/negative and buy/sell auxiliaries.
+        h = cp.Variable(n, integer=True)
+        hpos, hneg = cp.Variable(n, nonneg=True), cp.Variable(n, nonneg=True)
+        buy, sell = cp.Variable(n, nonneg=True), cp.Variable(n, nonneg=True)
+        buying = cp.hstack([cp.Variable(boolean=True) if b > 0 else 0 for b in buy_bounds])
+        selling = cp.hstack([cp.Variable(boolean=True) if b > 0 else 0 for b in sell_bounds])
+        sign = cp.hstack(
+            [
+                1
+                if lower[j] >= 0
+                else 0
+                if upper[j] <= 0
+                else buying[j]
+                if current[j] == 0
+                else cp.Variable(boolean=True)
+                for j in range(n)
+            ]
+        )
+        selected = cp.hstack(
+            [
+                1
+                if lower[j] > 0 or upper[j] < 0
+                else buying[j] + selling[j]
+                if current[j] == 0
+                else cp.Variable(boolean=True)
+                for j in range(n)
+            ]
+        )
+        ah = hpos + hneg
         constraints = [
-            hpos >= 0,
-            hneg >= 0,
-            hpos <= cp.multiply(bounds, sign),
-            hneg <= cp.multiply(bounds, 1 - sign),
+            h == hpos - hneg,
+            h >= lower,
+            h <= upper,
+            hpos <= cp.multiply(np.maximum(upper, 0), sign),
+            hneg <= cp.multiply(np.maximum(-lower, 0), 1 - sign),
             ah <= cp.multiply(bounds, selected),
             ah >= selected,
-            buy >= 0,
-            sell >= 0,
-            buy <= cp.multiply(trade_bounds, buying),
-            sell <= cp.multiply(trade_bounds, selling),
+            buy <= cp.multiply(buy_bounds, buying),
+            sell <= cp.multiply(sell_bounds, selling),
             buy >= buying,
             sell >= selling,
             buying + selling <= 1,
@@ -207,39 +324,66 @@ class HedgeOptimizer:
             fees_buy.append(max(m.policy.minimum_commission, rate * buy_size))
             fees_sell.append(max(m.policy.minimum_commission, rate * sell_size))
             spread_cost.append((q.ask - q.bid) * (0.5 + m.policy.slippage_spread_fraction) * c.multiplier)
-        # Exact ceil of integer quantity / slice size, including zero trade.
-        constraints += [
-            buy_count >= 0,
-            sell_count >= 0,
-            cp.multiply(buy_sizes, buy_count) >= buy,
-            cp.multiply(buy_sizes, buy_count) <= buy + np.array(buy_sizes) - 1,
-            cp.multiply(sell_sizes, sell_count) >= sell,
-            cp.multiply(sell_sizes, sell_count) <= sell + np.array(sell_sizes) - 1,
-        ]
-        costs = (
-            np.array(spread_cost) @ (buy + sell)
-            + np.array(fees_buy) @ buy_count
-            + np.array(fees_sell) @ sell_count
-        )
+
+        def slice_count(amount, size, limit, active):
+            if size == 1:
+                return amount
+            if limit == 0:
+                return cp.Constant(0)
+            count = cp.Variable(integer=True)
+            constraints.extend(
+                [
+                    count >= active,
+                    count <= np.ceil(limit / size) * active,
+                    size * count >= amount,
+                    # The remainder allowance only exists for an active trade.
+                    # This eliminates phantom fractional commissions from the
+                    # LP relaxation without changing any integer solution.
+                    size * count <= amount + (size - 1) * active,
+                ]
+            )
+            return count
+
+        # Equal buy/sell slice schedules share one exact count. Asymmetric
+        # displayed liquidity still uses direction-specific counts and fees.
+        commissions = []
+        for j in range(n):
+            if buy_sizes[j] == sell_sizes[j] and fees_buy[j] == fees_sell[j]:
+                count = slice_count(
+                    buy[j] + sell[j],
+                    buy_sizes[j],
+                    max(buy_bounds[j], sell_bounds[j]),
+                    buying[j] + selling[j],
+                )
+                commissions.append(fees_buy[j] * count)
+            else:
+                buy_count = slice_count(buy[j], buy_sizes[j], buy_bounds[j], buying[j])
+                sell_count = slice_count(sell[j], sell_sizes[j], sell_bounds[j], selling[j])
+                commissions.append(fees_buy[j] * buy_count + fees_sell[j] * sell_count)
+        commissions = cp.hstack(commissions)
+        costs = np.array(spread_cost) @ (buy + sell) + cp.sum(commissions)
         all_h = [h[candidates.index(i)] if i in candidates else actual.get(i, 0) for i in ids]
         total_h = cp.hstack(all_h)
         absolute_h = cp.hstack(
             [ah[candidates.index(i)] if i in candidates else abs(actual.get(i, 0)) for i in ids]
         )
         # Cash sign is exact, so financing is not a fictitious adjustable loss.
-        cash_plus, cash_minus, cash_sign = (
-            cp.Variable(nonneg=True),
-            cp.Variable(nonneg=True),
-            cp.Variable(boolean=True),
-        )
         prices = np.array([quotes[i].mid * m.contract_map[i].multiplier for i in candidates])
         cash_after = float(snapshot.cash) - prices @ (h - current) - costs
         cash_bound = 10 * budget
-        constraints += [
-            cash_plus - cash_minus == cash_after,
-            cash_plus <= cash_bound * cash_sign,
-            cash_minus <= cash_bound * (1 - cash_sign),
-        ]
+        cost_bound = float(
+            np.array(spread_cost) @ np.maximum(buy_bounds, sell_bounds)
+            + np.sum(
+                np.maximum(
+                    np.array(fees_buy) * np.ceil(buy_bounds / np.array(buy_sizes)),
+                    np.array(fees_sell) * np.ceil(sell_bounds / np.array(sell_sizes)),
+                )
+            )
+        )
+        cash_lower = max(-cash_bound, float(snapshot.cash) + prices @ (current - upper) - cost_bound)
+        cash_upper = min(cash_bound, float(snapshot.cash) + prices @ (current - lower))
+        constraints += [cash_after >= -cash_bound, cash_after <= cash_bound]
+        cash_minus = _positive_part(-cash_after, -cash_upper, -cash_lower, constraints)
         days = scenarios.calendar_days
         short_stock = (
             cp.sum(
@@ -258,18 +402,25 @@ class HedgeOptimizer:
             max(0, -actual.get(i, 0)) * quotes[i].spot for i in frozen if m.contract_map[i].kind == "STK"
         )
         # Exact positive eligible-cash split: cannot invent interest to fit NAV.
-        eligible_plus, eligible_minus, eligible_sign = (
-            cp.Variable(nonneg=True),
-            cp.Variable(nonneg=True),
-            cp.Variable(boolean=True),
-        )
         eligible_cash = cash_after - 1.02 * (short_stock + frozen_short) - m.policy.cash_interest_free_balance
         eligible_bound = 20 * budget + m.policy.cash_interest_free_balance
-        constraints += [
-            eligible_plus - eligible_minus == eligible_cash,
-            eligible_plus <= eligible_bound * eligible_sign,
-            eligible_minus <= eligible_bound * (1 - eligible_sign),
-        ]
+        constraints += [eligible_cash >= -eligible_bound, eligible_cash <= eligible_bound]
+        short_bound = frozen_short + sum(
+            max(0, -lower[j]) * quotes[i].spot
+            for j, i in enumerate(candidates)
+            if m.contract_map[i].kind == "STK"
+        )
+        eligible_lower = max(
+            -eligible_bound, cash_lower - 1.02 * short_bound - m.policy.cash_interest_free_balance
+        )
+        eligible_upper = min(
+            eligible_bound, cash_upper - 1.02 * frozen_short - m.policy.cash_interest_free_balance
+        )
+        eligible_plus = (
+            _positive_part(eligible_cash, eligible_lower, eligible_upper, constraints)
+            if m.policy.cash_rate
+            else cp.Constant(0)
+        )
         carry = (
             days
             / m.policy.cash_day_count
@@ -286,7 +437,13 @@ class HedgeOptimizer:
             objective_score = scenarios.weights @ cp.abs(scenarios.changes @ total_h + carry - costs)
         if strategy == "two_close" and scenarios.next_changes is not None:
             objective_score += scenarios.weights @ cp.abs(scenarios.next_changes @ total_h)
-        constraints += [scenarios.stress @ total_h - 2 * costs >= -m.risk.stress_loss * budget]
+        fixed_quantities = quantities.copy()
+        fixed_quantities[idx] = 0
+        stress_matrix, stress_fixed = _stress_projection(
+            scenarios.stress, idx, scenarios.stress @ fixed_quantities
+        )
+        metrics.update({"stress_rows_input": len(scenarios.stress), "stress_rows_model": len(stress_matrix)})
+        constraints += [stress_matrix @ h + stress_fixed - 2 * costs >= -m.risk.stress_loss * budget]
         if recovery_reference is not None:
             if not 0 < recovery_stress <= 0.0025 or not 0 < recovery_gross <= 0.05:
                 raise ValueError("Recovery budget cannot exceed validated bounds")
@@ -302,14 +459,16 @@ class HedgeOptimizer:
             recovery_costs = (
                 (
                     np.array(spread_cost)[recovery_j] @ (buy[recovery_j] + sell[recovery_j])
-                    + np.array(fees_buy)[recovery_j] @ buy_count[recovery_j]
-                    + np.array(fees_sell)[recovery_j] @ sell_count[recovery_j]
+                    + cp.sum(commissions[recovery_j])
                 )
                 if recovery_j
                 else 0
             )
+            recovery_matrix, recovery_fixed = _stress_projection(
+                scenarios.stress, idx, scenarios.stress @ (fixed_quantities - ref)
+            )
             constraints += [
-                scenarios.stress @ (total_h - ref) - 2 * recovery_costs >= -recovery_stress * budget
+                recovery_matrix @ h + recovery_fixed - 2 * recovery_costs >= -recovery_stress * budget
             ]
             constraints += [
                 cp.sum(
@@ -379,6 +538,7 @@ class HedgeOptimizer:
                 constraints += [cp.sum(selected[option_j]) + frozen_names <= m.risk.option_names]
         # Screening baselines choose numerical quantities, still using same hard constraints.
         baseline = None
+        baseline_vectors = []
         if strategy == "delta":
             baseline = cp.sum(cp.hstack([cp.abs(v @ total_h) for v in delta_vectors.values()]))
         elif strategy == "greek":
@@ -400,6 +560,7 @@ class HedgeOptimizer:
                         ]
                     )
                     rows.append(cp.abs(vector @ total_h))
+                    baseline_vectors.append(vector)
             baseline = cp.sum(cp.hstack(rows))
         if strategy == "min_variance":
             # QP baseline supplies a desired continuous target, then integer L1
@@ -428,45 +589,203 @@ class HedgeOptimizer:
             "mip_rel_gap": 0.0,
             "mip_abs_gap": 1e-6,
         }
-        start = monotonic()
         primary = baseline if baseline is not None else objective_score
-        problem = cp.Problem(cp.Minimize(primary), constraints)
+        # One parameterized model for all lexicographic stages. CVXPY reuses
+        # canonicalization, and HiGHS receives the previous feasible incumbent
+        # through its supported warm-start interface (unchanged column order).
+        max_holdings = np.abs(quantities)
+        max_holdings[idx] = np.maximum(np.abs(lower), np.abs(upper))
+        carry_bound = (
+            days
+            / m.policy.cash_day_count
+            * (
+                m.policy.cash_rate * eligible_bound
+                + m.policy.financing_rate * cash_bound
+                + m.policy.borrow_rate * short_bound
+            )
+        )
+        next_objective = (
+            scenarios.weights @ cp.abs(scenarios.next_changes @ total_h)
+            if baseline is None and scenarios.next_changes is not None
+            else None
+        )
+        next_bound = (
+            float(np.max(np.abs(scenarios.next_changes) @ max_holdings))
+            if scenarios.next_changes is not None
+            else 0.0
+        )
+        primary_bound = abs(error) + float(np.max(np.abs(scenarios.changes) @ max_holdings))
+        primary_bound += carry_bound + cost_bound
+        if strategy == "two_close":
+            primary_bound += next_bound
+        if strategy == "delta":
+            primary_bound = sum(np.abs(v) @ max_holdings for v in delta_vectors.values())
+        elif strategy == "greek":
+            primary_bound = sum(np.abs(v) @ max_holdings for v in baseline_vectors)
+        elif strategy == "min_variance":
+            primary_bound = np.sum(
+                np.maximum(np.abs(lower - continuous.value), np.abs(upper - continuous.value))
+            )
+        weights = cp.Parameter(3, nonneg=True, value=[1, 0, 0])
+        primary_limit = cp.Parameter(nonneg=True, value=float(primary_bound + max(1, primary_bound * 1e-9)))
+        primary_epigraph = cp.Variable(nonneg=True)
+        constraints += [primary_epigraph >= primary, primary_epigraph <= primary_limit]
+        next_epigraph = cp.Variable(nonneg=True) if next_objective is not None else cp.Constant(0)
+        if next_objective is not None:
+            next_limit = cp.Parameter(nonneg=True, value=next_bound + max(1, next_bound * 1e-9))
+            constraints += [next_epigraph >= next_objective, next_epigraph <= next_limit]
+        # Original turnover/cardinality/stable-ID preference, unchanged.
+        tie = prices @ (buy + sell)
+        tie += cp.sum(selected) * 0.001 + np.arange(1, n + 1) @ h * 1e-9
+        problem = cp.Problem(
+            cp.Minimize(weights[0] * primary_epigraph + weights[1] * next_epigraph + weights[2] * tie),
+            constraints,
+        )
+        metrics["integer_variables"] = sum(
+            v.size for v in problem.variables() if v.attributes["integer"] or v.attributes["boolean"]
+        )
+        metrics["scalar_variables"] = problem.size_metrics.num_scalar_variables
+
+        accepted = {}
+
+        def stage(name, weight, absolute_gap, stage_budget=None):
+            started = monotonic()
+            weights.value = weight
+            # Canonicalize before computing the remaining solver budget.
+            problem.get_problem_data(cp.HIGHS, enforce_dpp=True)
+            remaining = deadline - monotonic()
+            if stage_budget is not None:
+                remaining = min(remaining, stage_budget)
+            if remaining <= 0:
+                metrics["stages"].append({"stage": name, "status": "TIMEOUT"})
+                return False
+            options["time_limit"] = remaining
+            options["mip_abs_gap"] = absolute_gap
+            if stage_budget is not None:
+                options["mip_max_nodes"] = m.policy.ranking_nodes
+            problem.solve(solver=cp.HIGHS, warm_start=True, enforce_dpp=True, highs_options=options)
+            info = problem.solver_stats.extra_stats
+            gap, bound = info.mip_gap, info.mip_dual_bound
+            metrics["stages"].append(
+                {
+                    "stage": name,
+                    "status": problem.status,
+                    "total_ms": round((monotonic() - started) * 1000, 3),
+                    "solver_ms": round(problem.solver_stats.solve_time * 1000, 3),
+                    "nodes": info.mip_node_count,
+                    "mip_gap": float(gap) if np.isfinite(gap) else None,
+                    "dual_bound": float(bound) if np.isfinite(bound) else None,
+                    "incumbent": float(problem.value) if np.isfinite(problem.value) else None,
+                    "absolute_gap_limit": absolute_gap,
+                }
+            )
+            valid = (
+                problem.status == "optimal"
+                and np.isfinite(bound)
+                # HiGHS excludes CVXPY's constant objective offset. Compare
+                # its own primal/dual values, especially for cardinality ties.
+                and info.objective_function_value - bound <= absolute_gap + 1e-5
+            )
+            if valid:
+                accepted.update(
+                    {
+                        "stage": name,
+                        "holdings": np.array(h.value, copy=True),
+                        "primary": float(primary.value),
+                        "next": float(next_objective.value) if next_objective is not None else None,
+                    }
+                )
+            return valid
+
         try:
-            problem.solve(solver=cp.HIGHS, highs_options=options)
-            if problem.status != "optimal":
-                return self._unchanged(snapshot, scenarios, error, quotes, problem.status.upper())
+            primary_band = 1 if baseline is None else 0.01
+            if not stage("primary", [1, 0, 0], primary_band / 4):
+                return self._unchanged(
+                    snapshot,
+                    scenarios,
+                    error,
+                    quotes,
+                    "OBJECTIVE_CERTIFICATE_FAILED"
+                    if problem.status == "optimal"
+                    else (problem.status or "TIMEOUT").upper(),
+                )
             optimum = float(primary.value)
-            constraints.append(primary <= optimum + (1 if baseline is None else 0.01))
-            if baseline is None and scenarios.next_changes is not None:
-                next_objective = scenarios.weights @ cp.abs(scenarios.next_changes @ total_h)
-                second = cp.Problem(cp.Minimize(next_objective), constraints)
-                options["time_limit"] = max(0.01, m.policy.solver_seconds - (monotonic() - start))
-                second.solve(solver=cp.HIGHS, highs_options=options)
-                if second.status != "optimal":
-                    return self._unchanged(snapshot, scenarios, error, quotes, "NEXT_CLOSE_TIMEOUT")
-                constraints.append(next_objective <= float(next_objective.value) + 1)
-            # Fixed ID ordering and single-thread solver; quantity tie-breaks are
-            # tiny and subordinate to dollar turnover and explicit cardinality.
-            tie = np.array([quotes[i].mid * m.contract_map[i].multiplier for i in candidates]) @ (buy + sell)
-            tie += cp.sum(selected) * 0.001 + np.arange(1, n + 1) @ h * 1e-9
-            final = cp.Problem(cp.Minimize(tie), constraints)
-            options["time_limit"] = max(0.01, m.policy.solver_seconds - (monotonic() - start))
-            final.solve(solver=cp.HIGHS, highs_options=options)
-            if final.status != "optimal" or monotonic() - start > m.policy.solver_seconds + 0.5:
-                return self._unchanged(snapshot, scenarios, error, quotes, "TIEBREAK_TIMEOUT")
+            # A certified lower bound, not the incumbent, anchors the original
+            # $1 selection band. Every final portfolio is therefore <= true
+            # global optimum + $1 even when the first stage stops with a small
+            # absolute gap. Baselines retain their original 0.01 band.
+            primary_bound = float(problem.solver_stats.extra_stats.mip_dual_bound)
+            primary_limit.value = primary_bound + primary_band
+            metrics.update(
+                {
+                    "primary_incumbent": optimum,
+                    "primary_lower_bound": primary_bound,
+                    "primary_selection_limit": float(primary_limit.value),
+                }
+            )
+            ranking_started = monotonic()
+            next_ranked = next_objective is None
+            if next_objective is not None:
+                if stage("next_close", [0, 1, 0], 0.25, m.policy.ranking_seconds / 2):
+                    next_ranked = True
+                    next_limit.value = float(problem.solver_stats.extra_stats.mip_dual_bound) + 1
+                    metrics["next_selection_limit"] = float(next_limit.value)
+            ranking_remaining = m.policy.ranking_seconds - (monotonic() - ranking_started)
+            if next_ranked and ranking_remaining > 0:
+                stage("turnover", [0, 0, 1], 1e-6, ranking_remaining)
+            metrics["accepted_stage"] = accepted["stage"]
+            metrics["turnover_complete"] = accepted["stage"] == "turnover"
+            metrics["ranking_complete"] = metrics["turnover_complete"] and (
+                next_objective is None or "next_selection_limit" in metrics
+            )
+            if monotonic() > deadline + 0.5:
+                return self._unchanged(snapshot, scenarios, error, quotes, "TIMEOUT")
+            # A timed-out ranking never replaces the saved certified solution.
+            if accepted["primary"] > primary_limit.value + 1e-5 or (
+                "next_selection_limit" in metrics
+                and accepted["next"] > metrics["next_selection_limit"] + 1e-5
+            ):
+                return self._unchanged(snapshot, scenarios, error, quotes, "OBJECTIVE_CERTIFICATE_FAILED")
             result = dict(actual)
-            for i, value in zip(candidates, h.value, strict=True):
+            for i, value in zip(candidates, accepted["holdings"], strict=True):
                 result[i] = int(round(value))
             result = {i: q for i, q in result.items() if q}
             delta = [result.get(i, 0) - actual.get(i, 0) for i in candidates]
             cost = execution_cost(m, quotes, candidates, delta)
             target_vector = np.array([result.get(i, 0) for i in ids])
-            new_pnl = (
-                error
-                + scenarios.changes @ target_vector
-                + float(carry.value)
-                - (0 if unscored_setup else cost)
+            planned_cash = float(snapshot.cash) - prices @ (target_vector[idx] - current) - cost
+            target_carry = cash_carry(
+                m,
+                planned_cash,
+                sum(
+                    max(0, -result.get(i, 0)) * quotes[i].spot for i in ids if m.contract_map[i].kind == "STK"
+                ),
+                days,
+                float(snapshot.nav),
             )
+            new_pnl = (
+                error + scenarios.changes @ target_vector + target_carry - (0 if unscored_setup else cost)
+            )
+            numerical_primary = float(scenarios.weights @ np.abs(new_pnl))
+            if strategy == "historical_l1":
+                numerical_primary = float(
+                    scenarios.weights @ np.abs(scenarios.changes @ target_vector + target_carry - cost)
+                )
+            elif strategy == "two_close" and scenarios.next_changes is not None:
+                numerical_primary += float(scenarios.weights @ np.abs(scenarios.next_changes @ target_vector))
+            elif strategy == "delta":
+                numerical_primary = float(sum(abs(v @ target_vector) for v in delta_vectors.values()))
+            elif strategy == "greek":
+                numerical_primary = float(sum(abs(v @ target_vector) for v in baseline_vectors))
+            elif strategy == "min_variance":
+                numerical_primary = float(np.sum(np.abs(target_vector[idx] - continuous.value)))
+            if numerical_primary > float(primary_limit.value) + 1e-5 or (
+                "next_selection_limit" in metrics
+                and float(scenarios.weights @ np.abs(scenarios.next_changes @ target_vector))
+                > metrics["next_selection_limit"] + 1e-5
+            ):
+                return self._unchanged(snapshot, scenarios, error, quotes, "OBJECTIVE_CERTIFICATE_FAILED")
+            metrics["returned_primary_objective"] = numerical_primary
             # No-trade includes its own carry, rather than comparing net against gross.
             current_carry = cash_carry(
                 m,
@@ -492,7 +811,14 @@ class HedgeOptimizer:
                 scenario_id=scenarios.identifier,
                 config_hash=m.config_hash,
                 estimated_cost=cost,
-                explanation=f"{strategy}: integer scenario hedge; {scenarios.source}. Costs are included once.",
+                explanation=(
+                    f"{strategy}: integer scenario hedge; {scenarios.source}. Costs are included once. "
+                    + (
+                        "Secondary ranking completed."
+                        if metrics["ranking_complete"]
+                        else f"Retained certified {accepted['stage']} target; secondary ranking budget exhausted."
+                    )
+                ),
             )
         except cp.error.SolverError as exc:
             return self._unchanged(snapshot, scenarios, error, quotes, f"SOLVER_ERROR:{exc}")
