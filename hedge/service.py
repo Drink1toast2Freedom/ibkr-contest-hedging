@@ -1031,6 +1031,8 @@ class TradingService:
                 "clock": self.now().isoformat(),
                 "snapshot_id": snap.version if snap else None,
                 "connected": self.broker.connected if self.demo else self.broker.ib.isConnected(),
+                "broker_qualified": self.broker.qualified,
+                "unavailable_instruments": self.broker.qualification_errors if not self.demo else {},
                 "nav": str(snap.nav) if snap else None,
                 "cash": str(snap.cash) if snap else None,
                 "accrued_cash": str(snap.accrued_cash) if snap and snap.accrued_cash is not None else None,

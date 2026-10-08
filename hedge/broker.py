@@ -36,6 +36,7 @@ class IBKRBroker:
         self.ib.RequestTimeout = 15
         self.ib.TimezoneTWS = "America/New_York"
         self.native = {}
+        self.qualification_errors = {}
         self.readonly = True
         self.qualified = False
         self.reconciled = False
@@ -144,6 +145,7 @@ class IBKRBroker:
         async with self.reconcile_lock:
             self.qualified = self.reconciled = False
             self.native.clear()
+            self.qualification_errors.clear()
             try:
                 await self._connect_and_qualify()
             except BaseException:
@@ -168,39 +170,75 @@ class IBKRBroker:
             raise ValueError("Configured paper account not accessible; live trading is disabled")
         for c in self.manifest.contracts:
             try:
-                details = await asyncio.wait_for(
-                    self.ib.reqContractDetailsAsync(IBContract(conId=c.con_id, exchange=c.exchange)), 15
-                )
+                await self._qualify_contract(c)
             except TimeoutError as exc:
-                raise ConnectionError(f"Contract qualification timed out: {c.label}") from exc
-            if len(details) != 1:
-                raise ValueError(f"Ambiguous/unavailable contract ID {c.con_id}")
-            native = details[0].contract
-            self.ticks_by_contract[c.con_id] = details[0].minTick
-            exchanges = details[0].validExchanges.split(",")
-            rules = details[0].marketRuleIds.split(",")
-            if "SMART" in exchanges and len(rules) == len(exchanges):
-                rule_id = int(rules[exchanges.index("SMART")] or 0)
-                if rule_id:
-                    self.market_rules[c.con_id] = await self.ib.reqMarketRuleAsync(rule_id)
-            if native.symbol != c.symbol or native.secType != c.kind or native.currency != c.currency:
-                raise ValueError(f"Contract identity mismatch: {c.con_id}")
-            if c.kind == "OPT":
-                if (
-                    native.lastTradeDateOrContractMonth[:8] != c.expiry.strftime("%Y%m%d")
-                    or native.right != c.right
-                    or native.strike != c.strike
-                    or int(native.multiplier) != c.multiplier
-                ):
-                    raise ValueError(f"Option expiry/strike/right/multiplier mismatch: {c.con_id}")
-                if c.trading_class and native.tradingClass != c.trading_class:
-                    raise ValueError(f"Trading class mismatch: {c.con_id}")
-            self.native[c.con_id] = native
+                message = f"Contract qualification timed out: {c.label}"
+                mandate_ids = set(self.manifest.mandatory)
+                mandate_ids |= {
+                    self.manifest.contract_map[i].underlying_id
+                    for i in self.manifest.mandatory
+                    if self.manifest.contract_map[i].kind == "OPT"
+                }
+                if c.con_id in mandate_ids:
+                    raise ConnectionError(message) from exc
+                self.qualification_errors[c.con_id] = message
+                self.emit("qualification_unavailable", {"con_id": c.con_id, "message": message})
+        snapshot = await self._download_state()
+        self._validate_required_qualification(snapshot)
         self.qualified = True
-        self.ib.reqMarketDataType(1)
-        for native in self.native.values():
-            self.ib.reqMktData(native, "236" if native.secType == "STK" else "", False, False)
-        await self._download_state()
+        if self.manifest.market_data_provider == "ibkr":
+            self.ib.reqMarketDataType(1)
+            for native in self.native.values():
+                self.ib.reqMktData(native, "236" if native.secType == "STK" else "", False, False)
+
+    def _validate_required_qualification(self, snapshot):
+        required = set(self.manifest.mandatory) | set(snapshot.quantities())
+        required |= {order.con_id for order in snapshot.orders if order.signed_remaining}
+        required |= {
+            self.manifest.contract_map[i].underlying_id
+            for i in tuple(required)
+            if i in self.manifest.contract_map and self.manifest.contract_map[i].kind == "OPT"
+        }
+        missing = required - self.native.keys()
+        if missing:
+            labels = [
+                self.manifest.contract_map[i].label if i in self.manifest.contract_map else str(i)
+                for i in sorted(missing)
+            ]
+            raise ValueError("Required holding/order contracts unavailable: " + "; ".join(labels))
+
+    async def _qualify_contract(self, c):
+        details = await asyncio.wait_for(
+            self.ib.reqContractDetailsAsync(IBContract(conId=c.con_id, exchange=c.exchange)), 15
+        )
+        if len(details) != 1:
+            raise ValueError(f"Ambiguous/unavailable contract ID {c.con_id}")
+        native = details[0].contract
+        if (
+            native.conId != c.con_id
+            or native.symbol != c.symbol
+            or native.secType != c.kind
+            or native.currency != c.currency
+        ):
+            raise ValueError(f"Contract identity mismatch: {c.con_id}")
+        if c.kind == "OPT":
+            if (
+                native.lastTradeDateOrContractMonth[:8] != c.expiry.strftime("%Y%m%d")
+                or native.right != c.right
+                or native.strike != c.strike
+                or int(native.multiplier) != c.multiplier
+            ):
+                raise ValueError(f"Option expiry/strike/right/multiplier mismatch: {c.con_id}")
+            if c.trading_class and native.tradingClass != c.trading_class:
+                raise ValueError(f"Trading class mismatch: {c.con_id}")
+        self.ticks_by_contract[c.con_id] = details[0].minTick
+        exchanges = details[0].validExchanges.split(",")
+        rules = details[0].marketRuleIds.split(",")
+        if "SMART" in exchanges and len(rules) == len(exchanges):
+            rule_id = int(rules[exchanges.index("SMART")] or 0)
+            if rule_id:
+                self.market_rules[c.con_id] = await self.ib.reqMarketRuleAsync(rule_id)
+        self.native[c.con_id] = native
 
     async def closing_nav_observation(self):
         """Fresh, explicitly requested account NAV; never reuse summary cache."""
@@ -263,7 +301,13 @@ class IBKRBroker:
         if not self.ib.accountValues(self.manifest.account):
             await asyncio.wait_for(self.ib.reqAccountUpdatesAsync(self.manifest.account), 15)
         self.reconciled = True
-        return self.snapshot()
+        snapshot = self.snapshot()
+        try:
+            self._validate_required_qualification(snapshot)
+        except ValueError:
+            self.reconciled = False
+            raise
+        return snapshot
 
     def snapshot(self):
         values = {
@@ -317,7 +361,7 @@ class IBKRBroker:
 
     def quotes(self):
         if self.external_quotes is not None:
-            return self.external_quotes(utcnow())
+            return {i: q for i, q in self.external_quotes(utcnow()).items() if i in self.native}
         result = {}
         for i, c in self.manifest.contract_map.items():
             native = self.native.get(i)
@@ -399,6 +443,8 @@ class IBKRBroker:
     async def submit(self, request, order_id):
         if self.readonly or not self.qualified or not self.reconciled or not self.ib.isConnected():
             raise ValueError("Broker is not ready for paper execution")
+        if request.con_id not in self.native:
+            raise ValueError("Order contract has not passed broker qualification")
         if request.account != self.manifest.account or not request.account.startswith("DU"):
             raise ValueError("Paper account identity rejected")
         if request.con_id not in self.manifest.allowlist:

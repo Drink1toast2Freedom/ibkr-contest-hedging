@@ -166,7 +166,9 @@ async def test_broker_summary_capture_requires_fresh_scoped_event(manifest, prov
         assert tags == "NetLiquidation"
         event.emit(SimpleNamespace(account="DU_OTHER", tag=tags, value="99", currency="USD"))
         if provide_fresh_value:
-            event.emit(SimpleNamespace(account=manifest.account, tag=tags, value="1000123.45", currency="USD"))
+            event.emit(
+                SimpleNamespace(account=manifest.account, tag=tags, value="1000123.45", currency="USD")
+            )
         end(request_id)
 
     broker.ib = SimpleNamespace(
@@ -261,3 +263,82 @@ async def test_qualification_timeout_is_bounded_and_disconnects(manifest, monkey
     with pytest.raises(ConnectionError, match="Contract qualification timed out: BA"):
         await broker.connect()
     assert disconnected and not broker.qualified and not broker.reconciled
+
+
+@pytest.mark.parametrize("exposure", ["unheld", "held", "working"])
+async def test_optional_timeout_only_quarantines_unheld_unordered_contract(manifest, snapshot, exposure):
+    import asyncio
+
+    from hedge.models import Position, WorkingOrder
+
+    m = manifest.model_copy(update={"market_data_provider": "moomoo"})
+    broker = IBKRBroker(m, asyncio.Queue())
+
+    async def connected(*args, **kwargs):
+        return None
+
+    broker.ib = SimpleNamespace(connectAsync=connected, managedAccounts=lambda: [m.account])
+
+    async def qualify(c):
+        if c.con_id == 103:
+            raise TimeoutError
+        broker.native[c.con_id] = object()
+
+    broker._qualify_contract = qualify
+    if exposure == "held":
+        snapshot = snapshot.model_copy(
+            update={"positions": (*snapshot.positions, Position(con_id=103, quantity=1))}
+        )
+    if exposure == "working":
+        snapshot = snapshot.model_copy(
+            update={"orders": (WorkingOrder(order_id=1, con_id=103, signed_remaining=1),)}
+        )
+
+    async def download():
+        return snapshot
+
+    broker._download_state = download
+    if exposure == "unheld":
+        await broker._connect_and_qualify()
+        assert broker.qualified and 103 not in broker.native
+        assert 103 in broker.qualification_errors
+    else:
+        with pytest.raises(ValueError, match="Required holding/order contracts unavailable"):
+            await broker._connect_and_qualify()
+        assert not broker.qualified
+
+
+def test_external_quotes_for_unqualified_candidates_are_excluded(manifest, quotes):
+    import asyncio
+
+    broker = IBKRBroker(manifest, asyncio.Queue())
+    broker.native = {10: object(), 101: object(), 102: object()}
+    broker.external_quotes = lambda now: quotes
+    assert set(broker.quotes()) == {10, 101, 102}
+
+
+async def test_native_contract_id_mismatch_is_rejected(manifest):
+    import asyncio
+
+    broker = IBKRBroker(manifest, asyncio.Queue())
+
+    async def details(c):
+        return [
+            SimpleNamespace(contract=SimpleNamespace(conId=999, symbol="BA", secType="STK", currency="USD"))
+        ]
+
+    broker.ib = SimpleNamespace(reqContractDetailsAsync=details)
+    with pytest.raises(ValueError, match="Contract identity mismatch"):
+        await broker._qualify_contract(manifest.contract_map[10])
+    assert not broker.native
+
+
+async def test_submit_rejects_unqualified_contract_even_with_ready_account(manifest):
+    import asyncio
+
+    broker = IBKRBroker(manifest, asyncio.Queue())
+    broker.ib = SimpleNamespace(isConnected=lambda: True)
+    broker.readonly = False
+    broker.qualified = broker.reconciled = True
+    with pytest.raises(ValueError, match="Order contract has not passed broker qualification"):
+        await broker.submit(SimpleNamespace(con_id=10), 1)

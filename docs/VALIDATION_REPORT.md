@@ -272,7 +272,7 @@ identity, finite values and timestamps are validated; records retain API
 provenance and can be revised from statements. Existing closes win; stale or late
 startup values cannot backfill a missed session.
 
-All 147 tests passed, zero failures or skips, including isolated PostgreSQL.
+All 153 tests passed, zero failures or skips, including isolated PostgreSQL.
 New coverage includes early closes, weekends, restarts, disconnect/retry,
 pre-close/late/nonfinite/wrong-account/wrong-source observations, statement races,
 fresh summary events rather than cached values, cleanup, startup/reconciliation
@@ -280,3 +280,10 @@ serialization and qualification timeouts. JS/control checks and Ruff passed.
 The fresh account-summary query also succeeded with a separate read-only IBKR
 client without writing a closing ledger entry before market close. See
 CLOSING_NAV_RECORDER.md. The first real scheduled capture remains a forward check.
+
+The additional optional-candidate fault checks quarantine only timed-out contracts
+with no holdings or working orders. Such quotes are excluded from optimization;
+direct submissions still reject unqualified IDs. Mandatory contracts, filled
+positions, orders and option underlyings remain required. A native contract-ID
+mismatch is rejected. The operator restarted TWS, restoring the original full
+universe lookup before final activation checks; limits were not raised.

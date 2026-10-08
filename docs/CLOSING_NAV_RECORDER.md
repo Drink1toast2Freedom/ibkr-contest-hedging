@@ -42,5 +42,9 @@ an estimated October 8 target of $995,386.81 under the approved approximate rate
 Official scoring still requires the actual daily rate. Limits remain unchanged.
 
 Broker initialization and reconciliation share a lock. Contract qualification
-has a 15-second deadline; failure disconnects and clears partial readiness for
-retry. Closing-summary subscriptions and handlers are removed after requests.
+has a 15-second deadline. Required-contract failure disconnects and clears readiness
+for retry. An unheld optional candidate that times out is quarantined: its quotes
+are excluded from optimization and its orders are rejected. Mandatory contracts,
+all filled holdings, working orders and their option underlyings must qualify.
+Native contract IDs, types, currency and option identity must match. Closing-summary
+subscriptions and handlers are removed after requests.
