@@ -12,7 +12,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 class Control(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    action: Literal["start", "pause", "main_feed", "new_demo", "advance_demo", "simulate_cycle"]
+    action: Literal[
+        "start", "pause", "main_feed", "new_demo", "advance_demo", "simulate_cycle", "run_demo", "stop_demo"
+    ]
 
 
 class AISettings(BaseModel):

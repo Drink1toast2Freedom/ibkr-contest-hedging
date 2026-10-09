@@ -14,10 +14,10 @@ from hedge.scenarios import ScenarioSet
 class Settings(Frozen):
     source_url: str = "http://127.0.0.1:8765"
     symbols: tuple[str, ...] = ("BA", "SPY", "QQQ", "XLI", "TLT")
-    quantities: tuple[int, ...] = (10, 25, 50, 100)
-    daily_expense_budget: Decimal = Field(default=Decimal("25"), gt=0)
-    daily_order_budget: int = Field(default=100, ge=2)
-    daily_turnover_budget: Decimal = Field(default=Decimal("100000"), gt=0)
+    quantities: tuple[int, ...] = (1, 5, 10, 25, 50, 100)
+    # None means a fresh, surplus-sized allowance, never an unlimited loss allowance.
+    daily_expense_budget: Decimal | None = Field(default=None, gt=0)
+    daily_order_budget: int = Field(default=2000, ge=2, le=10000)
     buffer: float = Field(default=25, ge=1)
     target_estimate_buffer: float = Field(default=25, ge=0)
     start_threshold: float = Field(default=10, gt=0)
@@ -26,7 +26,7 @@ class Settings(Frozen):
     maximum_overshoot_probability: float = Field(default=0.01, ge=0, le=0.05)
     monitor_seconds: float = Field(default=5, ge=1, le=60)
     assumed_cycle_seconds: float = Field(default=15, ge=5, le=120)
-    entry_window_minutes: int = Field(default=10, ge=3, le=30)
+    entry_window_minutes: int = Field(default=30, ge=3, le=30)
     entry_cutoff_minutes: int = Field(default=2, ge=2, le=10)
     scenario_age_seconds: int = Field(default=20, ge=1, le=60)
 

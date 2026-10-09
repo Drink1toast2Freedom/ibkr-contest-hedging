@@ -11,12 +11,16 @@
 <div class="notice"><strong>SHADOW ONLY · NO BROKER ORDERS</strong>
 <span>IBKR remains the account source. Moomoo supplies quotes through the main app. This add-on cannot trade.</span></div>
 <div id="demo-banner" class="notice demo" hidden><strong>FICTIONAL REHEARSAL</strong>
-<span>Values, quotes, fills, fees and time are synthetic. Buttons advance a simulated clock; no real account changes.</span></div>
+<span>Values, quotes, fills, fees and time are synthetic. The demo holds the mandatory straddle plus four fictional
+option hedges. Buttons advance a simulated clock; no real account changes.</span></div>
 <section class="controls"><button data-action="start">Start monitoring</button><button data-action="pause">Pause add-on</button>
 <button data-action="main_feed">Use main app feed</button><button data-action="new_demo">New synthetic rehearsal</button>
 <button id="simulate" data-action="simulate_cycle" disabled>Simulate one cycle</button>
+<button id="run-demo" data-action="run_demo" disabled>Run rehearsal automatically</button>
+<button id="stop-demo" data-action="stop_demo" disabled>Stop automatic rehearsal</button>
 <button id="advance" data-action="advance_demo" disabled>Advance demo 1 minute</button></section>
 <p id="message" role="status" aria-live="polite"></p>
+<p id="rehearsal-status" role="status" aria-live="polite"></p>
 <section class="status"><span id="state" class="badge">WAITING</span><strong id="reason">Loading…</strong>
 <p id="source"></p></section>
 <section class="metrics" id="metrics" aria-label="Surplus metrics"></section>
@@ -24,9 +28,11 @@
 <p class="muted">Marketable limit / IOC descriptors are research proposals. Each exit needs a fresh risk and quote check.
 Fill completion and fee timing are uncalibrated. No-action is always available.</p>
 <ul id="checks"></ul></section>
-<section class="panel"><h2>Capacity and research budgets</h2><dl id="capacity"></dl>
+<section class="panel"><h2>Completion plan and capacity</h2><dl id="capacity"></dl>
 <p class="muted">Modeled capacity assumes serial, completed cycles. No measured paper-trading capacity is asserted.
-Gains lower net reduction speed and do not replenish the expense budget.</p></section></div>
+Turnover is recorded with no limit. New loss allowance follows the remaining surplus; an optional fixed expense cap
+can be configured. Forecast uncertainty and minimum cycle costs can leave a residual.</p></section></div>
+<section class="panel"><h2>Why a cycle is unavailable</h2><p id="blocking">No blocking constraint.</p></section>
 <section class="panel"><h2>Optional AI explanation</h2><p>The Google supervisor receives bounded metrics and can explain them.
 It cannot change budgets, prices, quantities or execution.</p>
 <div class="controls"><select id="model" aria-label="Google model"></select>

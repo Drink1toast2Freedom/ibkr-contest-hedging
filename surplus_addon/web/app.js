@@ -27,7 +27,10 @@ function draw(s) {
   const d=s.decision, p=d.proposal, st=d.stats||{}, b=d.budget||{}, demo=s.source==='synthetic rehearsal';
   $('demo-banner').hidden=!demo;text('state',d.state);text('reason',d.reason);
   text('source',`${s.source} · ${d.account||'Waiting for account'} · ${time(d.at)} · main mode ${d.main_mode||'unavailable'}`);
-  $('simulate').disabled=!(demo&&s.enabled&&d.state==='PROPOSED');$('advance').disabled=!demo;
+  const running=Boolean(s.rehearsal?.running);
+  $('simulate').disabled=!(demo&&s.enabled&&!running&&d.state==='PROPOSED');$('advance').disabled=!demo||running;
+  $('run-demo').disabled=!(demo&&s.enabled&&!running&&d.state!=='CLOSED');$('stop-demo').disabled=!running;
+  text('rehearsal-status',s.rehearsal?.reason||'Automatic rehearsal is stopped');
   const metrics=[['NAV estimate',money(d.nav),'Accrued interest already included'],['Closing target',money(d.target),d.target_estimated?'Approved approximate benchmark':'Official rule / synthetic in demo'],
     ['Current gap',money(d.current_gap),'NAV minus closing target'],['Projected closing gap',money(d.predicted_closing_gap),'Before any NEW cycle'],
     ['Movement buffer',money(d.buffer),'Forecast tail and mark uncertainty'],['Needed reduction',money(d.needed_reduction),'After the buffer'],
@@ -35,7 +38,15 @@ function draw(s) {
   $('metrics').replaceChildren();for(const [label,value,note]of metrics){const div=document.createElement('div');div.className='metric';for(const [tag,t]of [['span',label],['strong',value],['small',note]]){const e=document.createElement(tag);e.textContent=t;div.append(e);}$('metrics').append(div);}
   text('proposal',p?`${p.symbol}: buy and restore ${p.quantity} shares. Entry cap ${p.buy_cap}; exit reference floor ${p.sell_floor}. Modeled reduction ${money(p.modeled_loss)}; reserve ${money(p.expense_reserve)}. Expected score improvement ${money(p.expected_score_improvement)}. Modeled overshoot ${(p.overshoot_probability*100).toFixed(2)}%.`: 'No eligible proposal. '+d.reason);
   $('checks').replaceChildren();for(const msg of [p?`${p.path_checked_holdings} partial-fill holdings independently checked.`:'No proposal can be simulated.',...(d.assumptions||[])]){const li=document.createElement('li');li.textContent=msg;$('checks').append(li);}
-  $('capacity').replaceChildren();for(const [label,value] of [['Expense budget left',money(b.expense_remaining)],['Orders left',b.orders_remaining??'Unavailable'],['Turnover left',money(b.turnover_remaining)],['Confirmed simulated loss',money(st.confirmed_loss)],['Modeled feasible capacity',money(d.capacity?.modeled)],['Empirically supported capacity','Uncalibrated'],['Modeled cycle speed',number(p?.modeled_loss_per_second)+' $/s'],['Unremovable modeled surplus',money(d.projected_unremovable_surplus)]]){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value;$('capacity').append(dt,dd);}
+  const capacityRows=Number.isFinite(d.closing_gap)?[
+    ['Turnover limit','None · tracking only'],['Recorded turnover',money(st.turnover)],
+    ['Completed synthetic cycles',st.cycles??0],['Order equivalents',st.orders??0],
+    ['Simulated commissions',money(st.fees)],['Confirmed simulated net loss',money(st.confirmed_loss)],
+    ['Closing residual',money(d.closing_gap)],['Synthetic closing score',money(d.closing_score)],
+    ['Empirically supported capacity','Uncalibrated']
+  ]:[['Next-cycle loss allowance',money(b.expense_remaining)],['Allowance basis',b.expense_mode||'Unavailable'],['Orders left',b.orders_remaining??'Unavailable'],['Turnover limit','None · tracking only'],['Recorded turnover',money(st.turnover)],['Confirmed simulated loss',money(st.confirmed_loss)],['Modeled reducible surplus',money(d.capacity?.modeled)],['Full reducible-surplus capacity',d.capacity?.completion_feasible===undefined?'Unavailable':d.capacity.completion_feasible?'Sufficient under current assumptions':'Insufficient time or budget'],['Expected time needed',Number.isFinite(d.capacity?.expected_seconds_to_target)?Math.ceil(d.capacity.expected_seconds_to_target)+' simulated seconds':'Unavailable'],['Protected surplus',money(d.protected_surplus)],['Capacity shortfall',money(d.projected_unremovable_surplus)],['Empirically supported capacity','Uncalibrated']];
+  $('capacity').replaceChildren();for(const [label,value] of capacityRows){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value;$('capacity').append(dt,dd);}
+  text('blocking',d.blocking_constraints?Object.entries(d.blocking_constraints).map(([reason,count])=>`${reason} (${count} candidates)`).join('; '):d.state==='PROPOSED'?'No blocking constraint for the selected cycle.':d.reason);
   if(!busy){$('model').replaceChildren();for(const model of s.ai.models){const option=document.createElement('option');option.value=model;option.textContent=model;option.selected=model===s.ai.model;$('model').append(option);}}
   text('ai-status',`${s.ai.enabled?'Enabled':'Disabled'} · ${s.ai.configured?'Local Google key configured':'Local Google key unavailable'} · ${s.ai.status}`);
   text('advice',s.advice?`${s.advice_stale?'Stale explanation · ':''}${s.advice.explanation}`:'AI advice is optional and off by default. Numerical monitoring never waits for AI.');
@@ -43,7 +54,7 @@ function draw(s) {
   rows('history',s.history||[],[d=>time(d.at),d=>d.state,d=>money(d.predicted_closing_gap),d=>d.reason]);
   text('provenance',`Compute ${d.compute_ms??'—'} ms · snapshot ${d.snapshot_id||'unavailable'} · scenario ${d.scenario_id||'unavailable'} · config ${d.config_hash||'unavailable'}`);
 }
-async function refresh(){if(busy)return;try{const r=await fetch('/api/state');if(!r.ok)throw new Error('Research dashboard unavailable');draw(await r.json());}catch(e){text('message',e.message);$('simulate').disabled=true;}}
+async function refresh(){if(busy)return;try{const r=await fetch('/api/state');if(!r.ok)throw new Error('Research dashboard unavailable');draw(await r.json());}catch(e){text('message',e.message);$('simulate').disabled=true;$('run-demo').disabled=true;}}
 async function command(path,body){if(busy)return;busy=true;text('message','Working…');try{await post(path,body);text('message','Research setting applied. No broker orders.');}catch(e){text('message',e.message);}finally{busy=false;await refresh();}}
 for(const button of document.querySelectorAll('[data-action]'))button.addEventListener('click',()=>command('/api/control',{action:button.dataset.action}));
 $('enable-ai').addEventListener('click',()=>command('/api/ai/settings',{model:$('model').value,enabled:true}));

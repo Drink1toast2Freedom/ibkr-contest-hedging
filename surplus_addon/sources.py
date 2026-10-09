@@ -47,7 +47,7 @@ class AppSource:
 
 
 class DemoSource:
-    def __init__(self):
+    def __init__(self, entry_window_minutes=30):
         m = demo_manifest()
         self.manifest = type(m).model_validate(
             {
@@ -56,10 +56,13 @@ class DemoSource:
                 "account": "DU_ADDON_SIM_" + uuid4().hex[:8],
             }
         )
-        self.now = m.session_close(m.scoring_sessions[0]) - timedelta(minutes=6)
+        self.now = m.session_close(m.scoring_sessions[0]) - timedelta(minutes=entry_window_minutes)
         self.start = self.now
         self.loss = Decimal(0)
         self.cycles = 0
+        # A declared fictional structural hedge makes a full-window capacity
+        # rehearsal meaningful. These are not new positions in any broker account.
+        self.holdings = {**self.manifest.mandatory, 103: -13, 104: -12, 105: -13, 106: -12}
         self.start_marks = demo_quotes(self.manifest, self.now)
         self.engine = ScenarioEngine(self.manifest)
 
@@ -69,11 +72,11 @@ class DemoSource:
     def packet(self):
         m, quotes = self.manifest, demo_quotes(self.manifest, self.now)
         values = sum(
-            Decimal(str(quotes[i].mid)) * q * m.contract_map[i].multiplier for i, q in m.mandatory.items()
+            Decimal(str(quotes[i].mid)) * q * m.contract_map[i].multiplier for i, q in self.holdings.items()
         )
         start_values = sum(
             Decimal(str(self.start_marks[i].mid)) * q * m.contract_map[i].multiplier
-            for i, q in m.mandatory.items()
+            for i, q in self.holdings.items()
         )
         nav = Decimal("1000600") + values - start_values - self.loss
         snapshot = PortfolioSnapshot(
@@ -84,7 +87,7 @@ class DemoSource:
             cash=nav - values,
             excess_liquidity=Decimal("800000") - self.loss,
             initial_margin=Decimal("200000"),
-            positions=tuple(Position(con_id=i, quantity=q) for i, q in m.mandatory.items()),
+            positions=tuple(Position(con_id=i, quantity=q) for i, q in self.holdings.items()),
             source="synthetic",
         )
         # No next-session forecast is substituted after today's close.

@@ -1,10 +1,11 @@
 # Standalone SHADOW/SYNTHETIC research only. These caps do not authorize broker trades.
 source_url: http://127.0.0.1:8765
 symbols: [BA, SPY, QQQ, XLI, TLT]
-quantities: [10, 25, 50, 100]
-daily_expense_budget: '25'
-daily_order_budget: 100
-daily_turnover_budget: '100000'
+quantities: [1, 5, 10, 25, 50, 100]
+# Null: size each new allowance from the remaining conservatively predicted surplus.
+# An optional fixed expense cap can still be configured; turnover is tracking only.
+daily_expense_budget: null
+daily_order_budget: 2000
 buffer: 25
 target_estimate_buffer: 25
 start_threshold: 10
@@ -13,6 +14,6 @@ minimum_improvement: 0.25
 maximum_overshoot_probability: 0.01
 monitor_seconds: 5
 assumed_cycle_seconds: 15
-entry_window_minutes: 10
+entry_window_minutes: 30
 entry_cutoff_minutes: 2
 scenario_age_seconds: 20

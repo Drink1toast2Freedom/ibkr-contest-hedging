@@ -1,7 +1,7 @@
 """Finite-action shadow evaluator. No broker, order manager, or solver ownership."""
 
 from datetime import timedelta
-from math import floor, sqrt
+from math import ceil, floor, sqrt
 from time import perf_counter
 
 import numpy as np
@@ -52,9 +52,10 @@ def evaluate(settings, packet, stats, now, active=False):
             else None
         ),
         "budget": {
-            "expense_remaining": max(0, float(settings.daily_expense_budget) - stats["expense_used"]),
+            "expense_remaining": None,
+            "expense_mode": "fixed cap" if settings.daily_expense_budget is not None else "remaining surplus",
             "orders_remaining": max(0, settings.daily_order_budget - stats["orders"]),
-            "turnover_remaining": max(0, float(settings.daily_turnover_budget) - stats["turnover"]),
+            "turnover_limit": None,
         },
         "completion_calibrated": False,
         "capacity": {"modeled": 0.0, "empirically_supported": None, "cycles": 0},
@@ -79,13 +80,17 @@ def evaluate(settings, packet, stats, now, active=False):
     if day == m.day_zero:
         return finish("CLOSED", "Day 0 is unscored; surplus reduction is disabled")
     if now >= close:
+        if result["current_gap"] is not None:
+            result["closing_gap"] = result["current_gap"]
+            result["closing_score"] = abs(result["current_gap"])
         return finish("CLOSED", "Scoring close reached; no new cycle")
     cutoff = close - timedelta(minutes=max(settings.entry_cutoff_minutes, m.policy.stock_cutoff_minutes))
     result["entry_cutoff"] = cutoff.isoformat()
     remaining = max(0, (cutoff - now).total_seconds())
     result["seconds_for_new_cycles"] = remaining
     if now >= cutoff:
-        return finish("CLOSED", "New-entry cutoff reached")
+        result["projected_unremovable_surplus"] = max(0, result["current_gap"] or 0)
+        return finish("CLOSED", "New-entry cutoff reached; remaining surplus is retained")
     if packet.target is None or packet.nav_estimate is None:
         return finish("WAITING", "Previous closing NAV or approved cash benchmark target unavailable")
     if not 0 <= (now - packet.generated_at).total_seconds() <= 10:
@@ -144,19 +149,39 @@ def evaluate(settings, packet, stats, now, active=False):
         needed_reduction=needed,
         required_loss_per_second=needed / remaining if remaining else None,
         current_modeled_score=float(scenarios.weights @ np.abs(z)),
+        protected_surplus=min(max(0, mean), buffer),
+    )
+    budget = result["budget"]
+    # Remaining surplus already contains every prior expense. Do not subtract ledger
+    # expenses from it again. A configured FIXED cap is a separate consumed allowance.
+    fixed_remaining = (
+        max(0, float(settings.daily_expense_budget) - stats["expense_used"])
+        if settings.daily_expense_budget is not None
+        else None
+    )
+    budget.update(
+        fixed_expense_remaining=fixed_remaining,
+        expense_remaining=min(needed, fixed_remaining) if fixed_remaining is not None else needed,
     )
     if now < close - timedelta(minutes=settings.entry_window_minutes):
         return finish("MONITORING", "Monitoring; outside the near-close research entry window")
     threshold = settings.stop_threshold if active else settings.start_threshold
     if needed <= threshold:
-        return finish("MONITORING", "No surplus above the movement buffer and hysteresis threshold")
-    budget = result["budget"]
-    if (
-        budget["orders_remaining"] < 2
-        or budget["expense_remaining"] <= 0
-        or budget["turnover_remaining"] <= 0
-    ):
-        return finish("WAITING", "Research daily budget exhausted", True)
+        complete = max(0, mean) <= settings.buffer + settings.stop_threshold
+        return finish(
+            "COMPLETE" if complete else "MONITORING",
+            "Reduction reached the configured tolerance and protected buffer"
+            if complete
+            else "Forecast uncertainty protects the remaining surplus; continue monitoring",
+            active,
+        )
+    if budget["orders_remaining"] < 2:
+        return finish("WAITING", "Order budget exhausted; two order equivalents required per cycle", True)
+    if budget["expense_remaining"] <= 0:
+        return finish("WAITING", "Configured fixed expense budget exhausted", True)
+    if remaining < settings.assumed_cycle_seconds:
+        result["projected_unremovable_surplus"] = needed
+        return finish("WAITING", "Insufficient time for a complete entry and restoration cycle", True)
     proposals, rejected = [], {}
     for column, identifier in enumerate(scenarios.ids):
         c, q = m.contract_map[identifier], packet.quotes[identifier]
@@ -168,7 +193,10 @@ def evaluate(settings, packet, stats, now, active=False):
         ):
             continue
         spread_issue = spread_error(m, c, q)
-        for size in sorted(set(settings.quantities)):
+        # Include every smaller integer slice so the final cycle can fit the remaining
+        # allowance. Large candidate ladders must not strand a small removable remainder.
+        path_risk = {}
+        for size in range(1, max(settings.quantities) + 1):
             label = f"{c.symbol}:{size}"
             if (
                 size > min(q.ask_size, q.bid_size, m.execution.stock_slice)
@@ -204,7 +232,8 @@ def evaluate(settings, packet, stats, now, active=False):
                 m.policy.commission_share * min(m.execution.stock_slice, q.bid_size),
             )
             cost = max(cost, float(buy_cap - sell_floor) * size + fee)
-            # Conservative expense and risk reserve. Favorable outcomes never refill this budget.
+            # Reserve the largest modeled adverse loss for this cycle. A fixed cap
+            # consumes gross expenses even when a favorable move offsets the net loss.
             move = (
                 scenarios.changes[:, column]
                 * size
@@ -212,9 +241,13 @@ def evaluate(settings, packet, stats, now, active=False):
             )
             turnover = float(buy_cap + sell_floor) * size + float(np.max(np.abs(move)))
             loss = cost - move
-            reserve = max(2 * cost, float(np.max(loss)))
-            if reserve > budget["expense_remaining"] or turnover > budget["turnover_remaining"]:
-                rejected[label] = "Insufficient expense/turnover reserve"
+            reserve = max(cost, float(np.max(loss)))
+            if reserve > budget["expense_remaining"]:
+                rejected[label] = (
+                    "Insufficient fixed expense reserve"
+                    if fixed_remaining is not None and fixed_remaining < needed
+                    else "Cycle loss reserve exceeds the remaining surplus allowance"
+                )
                 continue
             after = z - loss
             overshoot = float(scenarios.weights @ (after < 0))
@@ -235,23 +268,37 @@ def evaluate(settings, packet, stats, now, active=False):
             # Every entry/exit partial-fill holding is checked, including zero. No corrective exception.
             path_valid = True
             for partial in range(size + 1):
-                holdings = {**quantities, identifier: quantities.get(identifier, 0) + partial}
-                risk = gate.validate(snap, packet.quotes, scenarios, holdings, now, costs=reserve)
-                if not risk.passed:
+                # Reserve varies by candidate. Cache the cost-free metrics, then check
+                # both linear reserve effects explicitly for this candidate.
+                if partial not in path_risk:
+                    holdings = {**quantities, identifier: quantities.get(identifier, 0) + partial}
+                    path_risk[partial] = gate.validate(snap, packet.quotes, scenarios, holdings, now)
+                risk = path_risk[partial]
+                reserve_fits = risk.metrics.get(
+                    "stress_loss", float("inf")
+                ) + reserve <= m.risk.stress_loss * risk.metrics.get("budget", 0) + 0.01 and risk.metrics.get(
+                    "excess_liquidity_estimate", 0
+                ) - reserve >= m.risk.liquidity_buffer * risk.metrics.get("budget", 0)
+                if not risk.passed or not reserve_fits:
                     path_valid = False
-                    rejected[label] = "Temporary-inventory risk: " + "; ".join(risk.reasons)
+                    rejected[label] = "Temporary-inventory risk: " + (
+                        "; ".join(risk.reasons)
+                        if not risk.passed
+                        else "Expense reserve exceeds risk/liquidity headroom"
+                    )
                     break
             if not path_valid:
                 continue
-            cycles = max(
-                0,
-                min(
-                    floor(remaining / settings.assumed_cycle_seconds),
-                    budget["orders_remaining"] // 2,
-                    floor(budget["expense_remaining"] / max(reserve, 1e-9)),
-                    floor(budget["turnover_remaining"] / max(turnover, 1e-9)),
-                ),
+            modeled_loss = float(scenarios.weights @ loss)
+            available_cycles = min(
+                floor(remaining / settings.assumed_cycle_seconds), budget["orders_remaining"] // 2
             )
+            if fixed_remaining is not None:
+                available_cycles = min(available_cycles, floor(fixed_remaining / max(reserve, 1e-9)))
+            # Re-evaluate after each cycle. This capacity is a frozen-input expectation,
+            # not an authorization to run the full sequence without fresh checks.
+            cycles_to_target = ceil(needed / max(modeled_loss, 1e-9))
+            cycles = min(available_cycles, cycles_to_target)
             if not cycles:
                 rejected[label] = "Insufficient modeled time or budget for a complete cycle"
                 continue
@@ -266,7 +313,7 @@ def evaluate(settings, packet, stats, now, active=False):
                     "buy_cap": str(buy_cap),
                     "sell_floor": str(sell_floor),
                     "original_quantity": quantities.get(identifier, 0),
-                    "modeled_loss": float(scenarios.weights @ loss),
+                    "modeled_loss": modeled_loss,
                     "modeled_cost": cost,
                     "expense_reserve": reserve,
                     "turnover": turnover,
@@ -276,23 +323,64 @@ def evaluate(settings, packet, stats, now, active=False):
                     "improvement_uncertainty": uncertainty,
                     "expected_score_after": float(scenarios.weights @ np.abs(after)),
                     "path_checked_holdings": size + 1,
-                    "modeled_loss_per_second": cost / settings.assumed_cycle_seconds,
+                    "modeled_loss_per_second": modeled_loss / settings.assumed_cycle_seconds,
                     "remaining_cycles": cycles,
-                    "modeled_capacity": cycles * cost,
+                    "modeled_capacity": min(needed, cycles * modeled_loss),
+                    "time_order_capacity": max(0, available_cycles * modeled_loss),
+                    "cycles_to_target": cycles_to_target,
+                    "expected_seconds_to_target": cycles_to_target * settings.assumed_cycle_seconds,
+                    "completion_feasible": available_cycles >= cycles_to_target,
                     "cycle_seconds_assumption": settings.assumed_cycle_seconds,
                 }
             )
     result["rejected_candidates"] = rejected
     if not proposals:
-        return finish("WAITING", "No bounded cycle passes the score, data, budget and path checks", True)
-    chosen = max(proposals, key=lambda p: (p["expected_score_improvement"], -p["turnover"]))
+        counts = {}
+        for reason in rejected.values():
+            counts[reason] = counts.get(reason, 0) + 1
+        result["blocking_constraints"] = counts
+        result["retry_when_forecast_changes"] = any(
+            r in counts
+            for r in (
+                "Score improvement/uncertainty or overshoot buffer failed",
+                "Cycle loss reserve exceeds the remaining surplus allowance",
+            )
+        ) and not any(
+            r.startswith(("Stale/", "Temporary-inventory risk:", "Execution spread")) for r in counts
+        )
+        result["projected_unremovable_surplus"] = needed
+        reason = max(counts, key=counts.get) if counts else "No eligible stock/ETF in the scenario universe"
+        return finish("WAITING", "No eligible cycle: " + reason, True)
+    chosen = max(
+        proposals,
+        key=lambda p: (
+            p["modeled_capacity"],
+            p["expected_score_improvement"],
+            -p["expense_reserve"],
+            -p["turnover"],
+        ),
+    )
     result["proposal"] = chosen
     result["capacity"] = {
         "modeled": chosen["modeled_capacity"],
         "cycles": chosen["remaining_cycles"],
         "empirically_supported": None,
+        "completion_feasible": chosen["completion_feasible"],
+        "expected_seconds_to_target": chosen["expected_seconds_to_target"],
+        "time_order_capacity": chosen["time_order_capacity"],
     }
     result["projected_unremovable_surplus"] = max(0, needed - chosen["modeled_capacity"])
+    result["pace"] = {
+        "required": result["required_loss_per_second"],
+        "modeled": chosen["modeled_loss_per_second"],
+        "observed": stats.get("observed_loss_per_second"),
+    }
     return finish(
-        "PROPOSED", "Shadow proposal only; completed-cycle fills and fees remain uncalibrated", True
+        "PROPOSED",
+        (
+            "Surplus-sized cycle proposed; replan after every completed cycle"
+            if chosen["completion_feasible"]
+            else "Insufficient modeled time/order capacity for full reduction; best feasible cycle proposed"
+        ),
+        True,
     )

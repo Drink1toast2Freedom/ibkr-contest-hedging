@@ -197,7 +197,6 @@ def test_partial_fill_risk_failure_blocks_every_action(demo, research):
     "settings",
     [
         {"daily_expense_budget": "1"},
-        {"daily_turnover_budget": "100"},
         {"symbols": ("UNAPPROVED",)},
     ],
 )
@@ -266,7 +265,9 @@ def test_completed_loss_is_not_subtracted_twice(demo, research):
     # Holding NAV fixed represents a cost already accounted in this particular anchor.
     after = check(demo, research, packet=packet)
     assert after["predicted_closing_gap"] == before["predicted_closing_gap"]
-    assert after["budget"]["expense_remaining"] < before["budget"]["expense_remaining"]
+    assert after["budget"]["expense_remaining"] == before["budget"]["expense_remaining"]
+    capped_before = check(demo, research, Settings(daily_expense_budget="25"), packet=packet)
+    assert capped_before["budget"]["expense_remaining"] < 25
 
 
 @pytest.mark.parametrize(
@@ -279,6 +280,7 @@ def test_completed_loss_is_not_subtracted_twice(demo, research):
         {"stop_threshold": 10},
         {"symbols": ("BA", "BA")},
         {"execution_enabled": True},
+        {"daily_turnover_budget": "100000"},
     ],
 )
 def test_invalid_configuration_rejected(change):
@@ -327,8 +329,9 @@ async def test_service_feedback_pause_and_isolation(tmp_path):
     assert first["state"] == "PROPOSED" and not service.advisor.enabled
     after = (await service.control("simulate_cycle"))["decision"]
     assert after["stats"]["cycles"] == 1 and after["current_gap"] < first["current_gap"]
-    assert service.packet.snapshot.quantities() == service.packet.manifest.mandatory
-    assert after["stats"]["expense_used"] <= 25 and after["stats"]["paper_calibrated"] is False
+    assert service.packet.snapshot.quantities() == service.demo.holdings
+    assert after["budget"]["expense_mode"] == "remaining surplus"
+    assert after["stats"]["paper_calibrated"] is False
     await service.control("pause")
     assert service.decision["proposal"] is None
     with pytest.raises(ValueError):
@@ -449,7 +452,7 @@ async def test_addon_advisor_is_bounded_and_never_applied(tmp_path, monkeypatch,
 
 
 async def test_repeated_simulation_respects_all_budgets(tmp_path):
-    settings = Settings()
+    settings = Settings(daily_expense_budget="25")
     service = Service(settings, tmp_path / "research.sqlite", demo=True, ai_path=tmp_path / "ai.json")
     await service.tick()
     for _ in range(60):
@@ -458,10 +461,136 @@ async def test_repeated_simulation_respects_all_budgets(tmp_path):
         await service.control("simulate_cycle")
         stats = service.decision["stats"]
         assert stats["expense_used"] <= float(settings.daily_expense_budget) + 1e-7
-        assert stats["turnover"] <= float(settings.daily_turnover_budget) + 1e-7
         assert stats["orders"] <= settings.daily_order_budget
     assert service.decision["proposal"] is None
-    assert service.packet.snapshot.quantities() == service.packet.manifest.mandatory
+    assert service.packet.snapshot.quantities() == service.demo.holdings
+    await service.stop()
+
+
+def test_turnover_is_telemetry_not_a_limit(demo, research):
+    packet = demo.packet()
+    stats = research.stats(packet.manifest.active_session(demo.now), packet.snapshot.account, "synthetic")
+    before = evaluate(Settings(), packet, stats, demo.now)
+    stats["turnover"] = 10**12
+    after = evaluate(Settings(), packet, stats, demo.now)
+    assert after["state"] == "PROPOSED"
+    assert after["proposal"] == before["proposal"]
+    assert after["budget"]["turnover_limit"] is None
+    assert "turnover_remaining" not in after["budget"]
+
+
+def test_allowance_shrinks_with_the_actual_remaining_surplus(demo, research):
+    packet = demo.packet()
+    first = check(demo, research, packet=packet)
+    smaller = with_snapshot(packet, nav=Decimal("1000100")).model_copy(update={"nav_estimate": 1000100})
+    later = check(demo, research, packet=smaller, active=True)
+    assert 0 < later["budget"]["expense_remaining"] < first["budget"]["expense_remaining"]
+    assert later["proposal"]["expense_reserve"] <= later["needed_reduction"]
+
+
+def test_small_final_slice_and_capacity_shortfall(demo, research):
+    packet = demo.packet()
+    constant = packet.model_copy(
+        update={
+            "scenarios": packet.scenarios.model_copy(
+                update={
+                    "changes": tuple(
+                        tuple(0 for _ in packet.scenarios.ids) for _ in packet.scenarios.weights
+                    ),
+                }
+            )
+        }
+    )
+    settings = Settings(daily_expense_budget="2.5")
+    d = check(demo, research, settings, packet=constant)
+    assert d["state"] == "PROPOSED" and d["proposal"]["quantity"] == 12
+    assert d["proposal"]["expense_reserve"] <= 2.5
+    assert d["projected_unremovable_surplus"] > 0
+    # A large surplus must not be labeled feasible merely because turnover is unlimited.
+    huge = with_snapshot(packet, nav=Decimal("1100000")).model_copy(update={"nav_estimate": 1100000})
+    d = check(demo, research, packet=huge)
+    assert d["state"] == "PROPOSED" and not d["capacity"]["completion_feasible"]
+    assert d["projected_unremovable_surplus"] > 90000
+
+
+def test_loss_reserve_still_checks_liquidity_on_every_partial_holding(demo, research):
+    packet = demo.packet()
+    packet = with_snapshot(packet, excess_liquidity=Decimal("250002"))
+    d = check(demo, research, packet=packet)
+    assert d["risk"]["passed"]
+    assert d["proposal"] is None
+    assert any("Temporary-inventory risk" in r for r in d["rejected_candidates"].values())
+
+
+def test_specific_budget_and_time_blockers(demo, research):
+    packet = demo.packet()
+    stats = {"expense_used": 0, "orders": 2000, "turnover": 0}
+    d = evaluate(Settings(), packet, stats, demo.now)
+    assert "Order budget exhausted" in d["reason"] and d["proposal"] is None
+    stats.update(orders=0, expense_used=25)
+    d = evaluate(Settings(daily_expense_budget="25"), packet, stats, demo.now)
+    assert "fixed expense budget exhausted" in d["reason"]
+    demo.now = packet.forecast_close - timedelta(minutes=2, seconds=5)
+    d = check(demo, research)
+    assert "Insufficient time" in d["reason"]
+
+
+async def test_full_automatic_rehearsal_reduces_surplus_and_reports_residual(tmp_path):
+    service = Service(Settings(), tmp_path / "full.sqlite", demo=True, ai_path=tmp_path / "ai.json")
+    before = await service.tick()
+    original = service.packet.snapshot.quantities()
+    assert before["current_gap"] == 600
+    assert before["capacity"]["completion_feasible"]
+    await service.control("run_demo")
+    for _ in range(130):
+        if not service.rehearsal_running:
+            break
+        await service.rehearsal_step()
+        assert service.packet.snapshot.quantities() == original
+        assert service.decision["execution_enabled"] is False
+        proposal = service.decision.get("proposal")
+        if proposal:
+            assert proposal["expense_reserve"] <= service.decision["budget"]["expense_remaining"]
+            assert proposal["overshoot_probability"] <= service.settings.maximum_overshoot_probability
+    assert not service.rehearsal_running
+    d = service.decision
+    assert d["state"] == "CLOSED"
+    assert 0 < d["closing_gap"] < 40
+    assert d["closing_score"] == abs(d["closing_gap"])
+    assert d["stats"]["cycles"] > 90 and d["stats"]["orders"] > 100
+    assert d["stats"]["turnover"] > 3000000 and d["stats"]["expense_used"] > 25
+    assert d["stats"]["paper_calibrated"] is False
+    await service.stop()
+
+
+async def test_auto_rehearsal_never_runs_on_broker_feed_and_pause_wins(tmp_path):
+    service = Service(Settings(), tmp_path / "auto.sqlite", demo=True, ai_path=tmp_path / "ai.json")
+    await service.control("run_demo")
+    with pytest.raises(ValueError):
+        await service.control("simulate_cycle")
+    with pytest.raises(ValueError):
+        await service.control("advance_demo")
+    await service.control("pause")
+    await service.rehearsal_step()
+    assert not service.rehearsal_running and service.demo.cycles == 0
+    await service.control("main_feed")
+    with pytest.raises(ValueError):
+        await service.control("run_demo")
+    assert not service.rehearsal_running
+    await service.stop()
+
+
+async def test_auto_rehearsal_clears_failed_snapshot_and_stops(tmp_path):
+    service = Service(Settings(), tmp_path / "failed.sqlite", demo=True, ai_path=tmp_path / "ai.json")
+    await service.control("run_demo")
+
+    async def unavailable():
+        raise ConnectionError("Unavailable")
+
+    service.demo.fetch = unavailable
+    await service.rehearsal_step()
+    assert not service.rehearsal_running and service.packet is None
+    assert service.decision["proposal"] is None and service.demo.cycles == 0
     await service.stop()
 
 

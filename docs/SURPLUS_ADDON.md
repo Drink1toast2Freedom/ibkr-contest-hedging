@@ -17,8 +17,12 @@ The official symmetric, interest-adjusted score and ordinary optimizer are uncha
 3. Open <http://127.0.0.1:8770/>. The default is **main app read-only feed**.
    It refreshes every five seconds; the page refreshes every two seconds.
 4. To test the entire feedback loop, click **New synthetic rehearsal**, then
-   **Simulate one cycle**. This creates fictional fills and fees and advances the
-   fictional clock by 15 seconds. **Advance demo 1 minute** tests the entry cutoff.
+   **Run rehearsal automatically**, or step it with **Simulate one cycle**. Each
+   completed fictional cycle advances the fictional clock by 15 seconds. Automatic
+   rehearsal keeps monitoring when uncertainty prevents a cycle, replans after
+   every completion, and reports the residual at the fictional close. **Stop automatic
+   rehearsal** stops this runner; **Pause add-on** also stops it. **Advance demo
+   1 minute** tests the entry cutoff when the automatic runner is stopped.
    No broker order is created and actual holdings are untouched.
 5. **Use main app feed** returns to current account observations. **Pause add-on**
    pauses only this research monitor. It does not pause the main hedging app.
@@ -37,8 +41,10 @@ or changes TWS, OpenD, PostgreSQL, subscriptions or main-app trading mode.
 - Validates matching account, snapshot/configuration/scenario identities, broker
   event revision, quote quality, freshness and current-session forecast horizon.
 - Derives current gap, predicted closing gap, movement/valuation buffer, needed
-  reduction, required speed, modeled capacity and unremovable residual surplus.
-- Checks a finite set of buy-and-restore stock/ETF cycles using the main
+  reduction, required and observed speed, modeled capacity, estimated completion
+  time and capacity shortfall. It reports protected surplus separately from capacity
+  shortfall; sufficient modeled capacity does not imply an exactly zero final score.
+- Checks all integer slices up to the configured maximum for buy-and-restore stock/ETF cycles using the main
   instrument allowlist and existing slice, liquidity and spread limits. Options,
   crypto, deliberate extreme prices and market orders are absent from v1.
 - Reuses the deterministic RiskGate independently for every integer partial-fill
@@ -51,8 +57,10 @@ or changes TWS, OpenD, PostgreSQL, subscriptions or main-app trading mode.
   closes, prevent new proposals. No next-session forecast substitutes for today.
 - Persists decisions and completed **synthetic** cycles in its own SQLite ledger,
   with exact Decimal loss/fee/turnover totals and snapshot/configuration links.
-  Gains lower net loss speed. Consumed execution expenses and adverse cycle loss
-  do not replenish budgets. Completed expenses already in NAV are not subtracted
+  Gains lower net loss speed. A configured fixed expense cap consumes gross expenses
+  and adverse cycle loss; gains do not replenish that cap. The default allowance
+  follows the remaining conservatively predicted surplus, already including prior
+  cycles and any offsetting gains. Completed expenses already in NAV are not subtracted
   again in the closing forecast; accrued interest is already in IBKR NAV.
 - Has an optional Google explanation panel and model selector. AI is off by
   default in this separate add-on. Enabling it uses the already configured local
@@ -61,17 +69,26 @@ or changes TWS, OpenD, PostgreSQL, subscriptions or main-app trading mode.
 
 ## Defaults and assumptions
 
-`config/surplus-addon.template.yaml` contains research defaults: $25 daily expense
-budget, 100 order equivalents, $100,000 turnover, quantities 10/25/50/100, one
-serial cycle, a 15-second assumed cycle duration, monitoring every five seconds,
-and entries only from 10 to 2 minutes before the scoring close. Copy it to
+`config/surplus-addon.template.yaml` contains research defaults: no turnover cap,
+no fixed dollar expense cap, 2,000 order equivalents, adaptive integer quantities
+from one through 100, one serial cycle, a 15-second assumed cycle duration,
+monitoring every five seconds, and entries from 30 to 2 minutes before the scoring
+close. The per-cycle worst modeled loss reserve must fit the remaining surplus
+above the movement buffer. This is a surplus-sized allowance, **not unlimited
+permission to lose account value**. The default minimum movement buffer remains
+$25, and existing liquidity, minimum-notional, risk and freshness checks still apply.
+An optional `daily_expense_budget` sets a separately enforced fixed cap. Copy it to
 `config/local.surplus-addon.yaml` and specify `--config` to change research inputs.
 These caps are simulation settings, not authorization to execute paper orders.
 
 The dashboard calls actual account observations **shadow** and fictional results
-**synthetic**. The synthetic rehearsal starts six minutes before a fictional
-scoring close with a $600 surplus so proposals, budget exhaustion and feedback
-can be exercised. Every new rehearsal has a new fictional account identifier;
+**synthetic**. The synthetic rehearsal starts 30 minutes before a fictional
+scoring close with a $600 surplus and declared fictional structural option hedges
+in four contracts at two neighboring strikes (13/12 short calls and 13/12 short puts). The exact
+25 mandatory calls and puts remain held. The hedges reduce the simulated book's
+forecast uncertainty so the full-window feedback loop can be exercised; they are
+not purchased in IBKR and are not evidence of actual contest performance.
+Every new rehearsal has a new fictional account identifier;
 its budgets and records cannot be confused with the actual paper account.
 
 Cycle descriptors use marketable **LMT/IOC** proposals, with cent-rounded entry
@@ -84,13 +101,25 @@ server-generated proposals after revalidation.
 
 Price variation during a cycle is modeled from remaining-session scenarios using
 square-root time scaling. Execution costs include spread, slippage, commissions
-and tick rounding. Expense and turnover reserves include unfavorable modeled
-cycle moves. This is a finite scenario bound, not a guarantee for every possible
-market move or fill. Candidate capacity assumes completed serial cycles and
-reserves sufficient expense/order/turnover budget for each. **Empirically supported
+and tick rounding. The expense reserve and turnover estimate include unfavorable
+modeled cycle moves. This is a finite scenario bound, not a guarantee for every possible
+market move or fill. Turnover remains recorded in the ledger and never rejects a
+proposal. Candidate capacity uses modeled net reduction, time and order capacity,
+plus worst-cycle expense reserves if a fixed cap was configured. It ranks total
+reducible capacity before immediate score improvement, and replans rather than
+authorizing an unchecked series. **Empirically supported
 paper capacity remains uncalibrated**, including fee/NAV timing and completion.
 The required loss speed may exceed feasible modeled capacity; the controller
-shows that shortfall rather than enlarging limits or inventing trades.
+shows that shortfall. Uncertainty, the protected buffer, discrete quantities,
+minimum commissions, minimum notionals and the entry cutoff can retain a surplus.
+Removing turnover does not guarantee removal of an arbitrary surplus or an exact
+closing NAV. The automatic runner advances a fictional clock only; the shadow feed
+never runs simulated cycles or creates orders in a real or paper account.
+
+Old custom configuration files with `daily_turnover_budget` must remove that field;
+validation rejects it so an obsolete setting cannot silently remain effective.
+To adopt the new surplus-sized allowance, set `daily_expense_budget: null`. Keeping
+`daily_expense_budget: '25'` deliberately retains a $25 fixed cap.
 
 Snapshot fetching has a three-second timeout. Numerical work runs outside the
 async event loop with one evaluation in flight and no queued backlog. LLM work
@@ -124,17 +153,29 @@ export, exact mandates, temporary inventory, unknown/stale state, cost accountin
 gain/loss attribution, budget reservation, target provenance, pauses, source
 changes, early closes, simulations, API controls, and UI feedback.
 
-Validation on this Mac: 196 existing checks and 64 add-on checks passed, including
-the isolated PostgreSQL integration check. Browser controls were exercised through
-one completed fictional cycle; its NAV reflected the loss and the main app stayed
-in shadow with no new broker intent.
+Validation on this Mac, October 9, 2026: **291 tests passed**, including 72 add-on
+checks and the isolated PostgreSQL integration check. The end-to-end automatic
+rehearsal ran over 90 completed cycles, exceeded $3 million recorded turnover,
+preserved all original holdings, and reduced the $600 starting surplus below $40
+at the fictional close. The residual is reported rather than labeled zero. This
+checks mechanics under the fixed synthetic seed, not real execution capacity or
+contest performance. Tests also cover optional fixed caps, small final slices,
+insufficient capacity, loss-reserve liquidity checks, automatic monitoring retries,
+pause/source changes and rejecting automatic cycles on the read-only account feed.
 
-An offline benchmark, ten samples per workload, recorded:
+The deployed browser rehearsal completed **97 cycles / 194 order equivalents**,
+with $3,714,368.09 turnover, $194.00 simulated commissions already included in
+$566.87 net cycle loss, and a **$32.68 closing residual**. Mandatory and initial
+hedge holdings were restored after every cycle. The fictional book's calendar
+mark movement also contributes to the closing NAV; commissions are not added to
+net cycle loss a second time. The main application remained in PAPER mode.
+
+An offline benchmark of the updated evaluator, five samples per workload, recorded:
 
 | Synthetic workload | Scenarios / stresses | Median compute | Maximum compute |
 |---|---|---|---|
-| 7 instruments | 64 / 70 | 18.2 ms | 18.4 ms |
-| Configured 24-instrument universe | 64 / 770 | 105.2 ms | 123.8 ms |
+| 7 instruments | 64 / 70 | 17.5 ms | 130.8 ms |
+| Configured 24-instrument universe | 64 / 770 | 80.9 ms | 97.0 ms |
 
 Both workloads produced bounded proposals, with all 101 partial holdings on the
 selected 100-share path checked. These timings exclude HTTP acquisition,

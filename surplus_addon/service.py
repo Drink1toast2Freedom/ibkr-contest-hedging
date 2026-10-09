@@ -52,7 +52,7 @@ class Service:
         self.settings = settings
         self.ledger = Ledger(ledger_path)
         self.reader = AppSource(settings, transport)
-        self.demo = DemoSource() if demo else None
+        self.demo = DemoSource(settings.entry_window_minutes) if demo else None
         self.enabled = True
         self.engaged = False
         self.packet = None
@@ -67,12 +67,19 @@ class Service:
         self.advice = None
         self.lock = asyncio.Lock()
         self.tasks = []
+        self.rehearsal_running = False
+        self.rehearsal_reason = "Automatic rehearsal is stopped"
 
     async def start(self):
         await self.tick()
-        self.tasks = [asyncio.create_task(self._loop()), asyncio.create_task(self._advice_loop())]
+        self.tasks = [
+            asyncio.create_task(self._loop()),
+            asyncio.create_task(self._advice_loop()),
+            asyncio.create_task(self._rehearsal_loop()),
+        ]
 
     async def stop(self):
+        self.rehearsal_running = False
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
@@ -122,24 +129,44 @@ class Service:
             return self.decision
 
     async def control(self, action):
+        if action in ("pause", "stop_demo", "main_feed", "new_demo"):
+            self.rehearsal_running = False
         async with self.lock:
             if action == "pause":
                 self.enabled, self.engaged = False, False
+                self.rehearsal_reason = "Automatic rehearsal stopped by operator pause"
             elif action == "start":
                 self.enabled = True
             elif action in ("main_feed", "new_demo"):
-                self.demo = DemoSource() if action == "new_demo" else None
+                self.demo = DemoSource(self.settings.entry_window_minutes) if action == "new_demo" else None
                 self.enabled, self.engaged, self.advice = True, False, None
+                self.rehearsal_reason = "Automatic rehearsal is stopped"
+            elif action == "run_demo":
+                if not self.enabled or self.demo is None:
+                    raise ValueError("Automatic simulation requires an active fictional rehearsal")
+                await self._tick()
+                if self.decision["state"] not in (
+                    "PROPOSED",
+                    "MONITORING",
+                    "COMPLETE",
+                ) and not self.decision.get("retry_when_forecast_changes"):
+                    raise ValueError(self.decision["reason"])
+                self.rehearsal_running = True
+                self.rehearsal_reason = "Replanning simulated cycles and monitoring remaining surplus"
+            elif action == "stop_demo":
+                self.rehearsal_reason = "Automatic rehearsal stopped; monitoring continues"
             elif action == "advance_demo":
                 if self.demo is None:
                     raise ValueError("Only the fictional rehearsal clock can be advanced")
+                if self.rehearsal_running:
+                    raise ValueError("Stop the automatic rehearsal before advancing its clock manually")
                 self.demo.now += timedelta(minutes=1)
             elif action == "simulate_cycle":
                 if not self.enabled or self.demo is None:
                     raise ValueError("Simulation requires an active fictional rehearsal")
-                await (
-                    self._tick()
-                )  # Revalidate current budgets, risk and forecast, not the browser's proposal.
+                if self.rehearsal_running:
+                    raise ValueError("Stop the automatic rehearsal before simulating a manual cycle")
+                await self._tick()  # Revalidate current evidence, not the browser's proposal.
                 if self.decision["state"] != "PROPOSED":
                     raise ValueError(self.decision["reason"])
                 cycle = self.demo.simulate(self.packet, self.decision["proposal"])
@@ -149,6 +176,60 @@ class Service:
                 raise ValueError("Unknown research control; broker trading is unavailable")
             await self._tick()
             return self.state()
+
+    async def _rehearsal_loop(self):
+        while True:
+            if self.rehearsal_running:
+                await self.rehearsal_step()
+            # Accelerated fictional time only; never a real order cadence.
+            await asyncio.sleep(0.1)
+
+    async def rehearsal_step(self):
+        async with self.lock:
+            if not self.rehearsal_running or not self.enabled or self.demo is None:
+                return
+            await self._tick()
+            if not self.rehearsal_running:
+                return
+            try:
+                state = self.decision["state"]
+                if state == "PROPOSED":
+                    cycle = await asyncio.to_thread(
+                        self.demo.simulate, self.packet, self.decision["proposal"]
+                    )
+                    if self.ledger.cycle(cycle):
+                        self.demo.apply(cycle)
+                    else:
+                        raise ValueError("Duplicate simulated cycle; reconcile the rehearsal ledger")
+                elif state in ("MONITORING", "COMPLETE") or (
+                    state == "WAITING" and self.decision.get("retry_when_forecast_changes")
+                ):
+                    # Keep observing: declining time-to-close can release the uncertainty
+                    # reserve. Do not label an early protected buffer as full completion.
+                    self.demo.now += timedelta(seconds=self.settings.assumed_cycle_seconds)
+                else:
+                    self.rehearsal_running = False
+                    self.rehearsal_reason = self.decision["reason"]
+                    if state == "CLOSED" and self.packet is not None:
+                        # No trade after cutoff. Finish the fictional close to report the
+                        # actual residual instead of claiming a zero closing score.
+                        self.demo.now = self.packet.forecast_close
+                    await self._tick()
+                    return
+                await self._tick()
+                self.rehearsal_reason = (
+                    "Replanning after each cycle; waiting when the forecast protects surplus"
+                )
+            except Exception as exc:
+                self.rehearsal_running = False
+                self.rehearsal_reason = "Automatic rehearsal stopped: " + type(exc).__name__
+                self.packet, self.engaged = None, False
+                self.decision = {
+                    "state": "WAITING",
+                    "reason": self.rehearsal_reason,
+                    "execution_enabled": False,
+                    "proposal": None,
+                }
 
     async def _advice_loop(self):
         while True:
@@ -167,6 +248,7 @@ class Service:
             "source": "synthetic rehearsal" if self.demo else "main app read-only feed",
             "enabled": self.enabled,
             "execution_enabled": False,
+            "rehearsal": {"running": self.rehearsal_running, "reason": self.rehearsal_reason},
             "decision": self.decision,
             "history": self.ledger.history(),
             "cycles": self.ledger.cycles(),
