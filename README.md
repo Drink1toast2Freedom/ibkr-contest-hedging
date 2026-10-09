@@ -64,6 +64,11 @@ python3.12 -m venv .venv
 
 ## Connect your student paper account
 
+Enabled paper operation uses [recoverable data waiting](docs/TRADING_CONTINUITY.md)
+for temporary quote/connection interruptions. It cancels system orders where
+possible, reconciles, and repeats the full preflight before automatically resuming.
+Manual pauses and safety stops still disable execution.
+
 1. Install IB Gateway (or TWS), authenticate to the instructor's **paper** account, and allow local socket API access. Gateway paper default: `4002`; TWS paper default: `7497`. The configured accessible `DU…` account is checked independently of the port.
 2. Start with the Gateway/TWS **Read-Only API** setting enabled. Verify API-accessible live stock and option subscriptions. Delayed or frozen prices cannot authorize execution. Student account entitlements may require the instructor's help.
 3. Copy `config/practice.template.yaml` to `config/local.contest.yaml`. Obtain the corrected dates, expiry, contract IDs, multiplier, scoring/report convention, and exact mandatory quantities. **The template is intentionally invalid. No conflicting practice dates are guessed.**

@@ -5,6 +5,7 @@ from datetime import timedelta
 from decimal import Decimal
 from uuid import uuid4
 
+from .continuity import quote_coverage
 from .models import OrderRequest, SetupPackageRequest, Target
 from .optimizer import execution_cost
 from .order_policy import choose_order, rounded_price, spread_error, urgency_for
@@ -29,6 +30,7 @@ class ExecutionManager:
     def economic_check(self, snapshot, quotes, scenarios, quantities, now):
         if self.score_context is None:
             return True
+        quote_coverage(quotes, scenarios.ids)
         from .optimizer import HedgeOptimizer
 
         previous, estimate = self.score_context(snapshot, quotes, now)
@@ -72,7 +74,9 @@ class ExecutionManager:
             difference = target.quantities.get(i, 0) - actual.get(i, 0)
             if not difference:
                 continue
-            c, q = self.manifest.contract_map[i], quotes[i]
+            c, q = self.manifest.contract_map.get(i), quotes.get(i)
+            if c is None or q is None:
+                continue
             size = min(
                 abs(difference),
                 self.manifest.execution.option_slice
@@ -284,6 +288,8 @@ class ExecutionManager:
             try:
                 fresh = self.broker.snapshot()
                 qs = self.broker.quotes()
+                if self.paused or self.pause_requested or self.broker.readonly:
+                    raise ValueError("Execution was paused during preflight")
                 clock = now if self.gate.demo else __import__("hedge.models", fromlist=["utcnow"]).utcnow()
                 if fresh.quantities() != actual or fresh.orders:
                     raise ValueError("Inventory/orders changed before transmission")
@@ -422,6 +428,8 @@ class ExecutionManager:
                 fresh = self.broker.snapshot()
                 qs = self.broker.quotes()
                 clock = now if self.gate.demo else __import__("hedge.models", fromlist=["utcnow"]).utcnow()
+                if self.paused or self.pause_requested or self.broker.readonly:
+                    raise ValueError("Protected setup was paused during preflight")
                 if fresh.quantities() != actual or fresh.orders:
                     raise ValueError("Inventory/orders changed during package preview")
                 for i in (buy_id, sell_id):

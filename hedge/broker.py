@@ -9,6 +9,7 @@ from typing import Protocol
 from ib_async import IB, ComboLeg, ExecutionFilter, LimitOrder, MarketOrder, TagValue
 from ib_async import Contract as IBContract
 
+from .continuity import DataUnavailable
 from .models import Execution, PortfolioSnapshot, Position, Quote, WorkingOrder, utcnow
 
 
@@ -343,7 +344,7 @@ class IBKRBroker:
         }
         required = ["NetLiquidation", "TotalCashValue", "ExcessLiquidity", "InitMarginReq"]
         if any(k not in values for k in required):
-            raise ValueError("Required account NAV/cash/margin fields unavailable")
+            raise DataUnavailable("Required account NAV/cash/margin fields unavailable")
         positions = []
         for p in self.ib.positions(self.manifest.account):
             if not float(p.position).is_integer():

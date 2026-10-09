@@ -228,3 +228,38 @@ def test_book_freshness_uses_latest_side_update_without_reviving_old_book():
     assert MoomooData.book_time(item) == fresh
     item["order_book"]["svr_recv_time_ask"] = old.isoformat()
     assert MoomooData.book_time(item) == old
+
+
+def test_future_last_trade_does_not_hide_verified_current_book(tmp_path):
+    from datetime import datetime
+
+    m = demo_manifest()
+    now = datetime.combine(m.scoring_sessions[0], datetime.min.time(), NY).replace(hour=10)
+    raw = fixture(m, now)
+    raw.update(
+        quote_server_connected=True,
+        rights={"us_qot_right": "LV3", "us_option_qot_right": "LV1"},
+        identities={},
+    )
+    for c in m.contracts:
+        item = raw["securities"][code_for(c)]
+        vendor_trade = now + timedelta(milliseconds=100)
+        item["quote"][0].update(data_date=str(vendor_trade.date()), data_time=vendor_trade.time().isoformat())
+        item.update(book_push_at=now.isoformat(), book_push_count=2)
+        if c.kind == "OPT":
+            raw["identities"][code_for(c)] = {
+                "stock_owner": "US.BA",
+                "strike_time": str(c.expiry),
+                "option_type": "CALL" if c.right == "C" else "PUT",
+                "strike_price": c.strike,
+            }
+    path = tmp_path / "quotes.json"
+    path.write_text(json.dumps(raw))
+    feed = MoomooData(m, path)
+    assert len(feed.quotes(now)) == len(m.contracts)
+    assert all(q.data_type == "live" and q.observed_at == now for q in feed.quotes(now).values())
+    # Same future trade without subsequent verified book updates remains unusable.
+    for item in raw["securities"].values():
+        item["book_push_count"] = 1
+    path.write_text(json.dumps(raw))
+    assert feed.quotes(now) == {}

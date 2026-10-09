@@ -65,8 +65,6 @@ class MoomooData:
                     row = item["quote"][0]
                     book = item["order_book"]
                     at = datetime.fromisoformat(row["data_date"] + "T" + row["data_time"]).replace(tzinfo=NY)
-                    if at > now:
-                        raise ValueError("Future provider timestamp")
                     stock_item = securities[f"US.{contract.symbol}"]
                     stock_book = stock_item["order_book"]
                     spot = (float(stock_book["Bid"][0][0]) + float(stock_book["Ask"][0][0])) / 2
@@ -122,6 +120,12 @@ class MoomooData:
                                 live = False
                                 errors.append(f"Model calibration blocked {contract.label}: {exc}")
                         greeks = self.engine.greeks(contract, spot, iv, now if live else at)
+                    # Last-trade time is not the timestamp of this executable book.
+                    # Vendor clocks can be slightly ahead of the callback clock;
+                    # a verified current book still uses its REAL bounded receipt
+                    # timestamp. Never revive an unverified/cached future trade.
+                    if not live and at > now:
+                        raise ValueError("Future unverified provider timestamp")
                     quotes[contract.con_id] = Quote(
                         provider="moomoo",
                         con_id=contract.con_id,

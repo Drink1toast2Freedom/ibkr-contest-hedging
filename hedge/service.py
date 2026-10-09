@@ -11,6 +11,7 @@ from pathlib import Path
 from .broker import IBKRBroker, SimBroker
 from .closing import ClosingRecorder
 from .config import NY
+from .continuity import DataUnavailable, data_only, quote_coverage
 from .data import QuoteRecorder
 from .demo import demo_quotes
 from .execution import ExecutionManager
@@ -24,7 +25,7 @@ from .scoring import ScoreLedger
 from .setup import SetupPlanner
 from .storage import payload
 from .supervisor import PROFILES, Supervisor
-from .universe import screen_options
+from .universe import screen_snapshot
 from .valuation import NAVTracker
 
 
@@ -61,6 +62,10 @@ class TradingService:
         self.profile = "STANDARD"
         self.ready = False
         self.health = "Starting"
+        self.control_epoch = 0
+        self.data_wait = None
+        self.resume_next_at = 0.0
+        self.pause_reason = None
         self.last_snapshot = None
         self.last_quotes = {}
         self.last_risk = None
@@ -214,9 +219,10 @@ class TradingService:
                             update={"connected": False, "reconciled": False}
                         )
                     self.ready = False
-                    self.mode = "PAUSED"
-                    self.execution.paused = True
-                    self.pending_target = None
+                    if event == "disconnected" and self._enter_data_wait("IBKR connection interrupted"):
+                        pass  # Cancel/reconcile in the monitor, never block event delivery.
+                    else:
+                        self._hard_stop(event)
                     self.alert("error", event)
                 elif event == "position":
                     identifier, quantity = value["con_id"], int(float(value["quantity"]))
@@ -252,12 +258,7 @@ class TradingService:
                     self.ready = False
                     self.alert("error", "Live API market data unavailable: " + value["message"])
             except Exception as exc:
-                self.execution.paused = True
-                self.mode, self.ready, self.health = (
-                    "PAUSED",
-                    False,
-                    f"Durable event processing failed: {exc}",
-                )
+                self._hard_stop(f"Durable event processing failed: {type(exc).__name__}: {exc}")
             finally:
                 self.events.task_done()
 
@@ -265,6 +266,95 @@ class TradingService:
         recent = self.store.records("alert", self.manifest.account, 1)
         if not recent or recent[0].get("message") != message:
             self.store.record("alert", self.manifest.account, {"severity": severity, "message": message})
+
+    def _hard_stop(self, reason):
+        self.control_epoch += 1
+        self.data_wait = None
+        self.pause_reason = reason
+        self.mode, self.ready, self.health = "PAUSED", False, reason
+        self.execution.paused = True
+        self.broker.readonly = True
+        self.pending_target = self.pending_recovery = None
+        self.active_plan_started = False
+
+    def _enter_data_wait(self, reason):
+        if self.mode in ("PAPER", "SETUP"):
+            self.data_wait = {
+                "resume_mode": self.mode,
+                "reason": reason,
+                "since": self.now().isoformat(),
+                "config_hash": self.manifest.config_hash,
+                "profile": self.profile,
+                "epoch": self.control_epoch,
+            }
+            self.resume_next_at = 0.0
+            self.store.record(
+                "continuity",
+                self.manifest.account,
+                {
+                    **self.data_wait,
+                    "status": "WAITING_DATA",
+                    "snapshot_id": self.last_snapshot.version if self.last_snapshot else None,
+                },
+            )
+        elif self.mode != "WAITING_DATA" or self.data_wait is None:
+            return False
+        self.data_wait["reason"] = reason
+        self.mode, self.ready = "WAITING_DATA", False
+        self.execution.paused = True
+        self.broker.readonly = True
+        self.pending_target = self.pending_recovery = None
+        self.active_plan_started = False
+        self.health = "Waiting for verified data; automatic preflight retry: " + reason
+        return True
+
+    async def _wait_for_data(self, reason):
+        if self._enter_data_wait(reason) and not self.execution.pause_requested:
+            await self.execution.pause()
+
+    async def _resume_after_data_wait(self):
+        wait = self.data_wait
+        if self.mode != "WAITING_DATA" or wait is None:
+            return
+        if (
+            wait["epoch"] != self.control_epoch
+            or wait["config_hash"] != self.manifest.config_hash
+            or wait["profile"] != self.profile
+        ):
+            self._hard_stop("Automatic resume invalidated by operator/configuration change")
+            return
+        if time.monotonic() < self.resume_next_at:
+            return
+        if self.last_risk and any(
+            reason.startswith(("Non-live quote:", "Stale/future quote:", "Missing/stale option Greeks:"))
+            for reason in self.last_risk.reasons
+        ):
+            return
+        if not self.manifest.can_trade(
+            self.now(),
+            "OPT" if wait["resume_mode"] == "SETUP" else "STK",
+            setup=wait["resume_mode"] == "SETUP",
+        ):
+            self.health = "Automatic resume waiting for a configured trading window"
+            return
+        self.resume_next_at = time.monotonic() + 15
+        if not self.execution.pause_requested:
+            await self.execution.pause()
+        try:
+            await self.control("paper" if wait["resume_mode"] == "PAPER" else "setup", _automatic=True)
+        except (ValueError, TimeoutError, ConnectionError) as exc:
+            if self.mode == "WAITING_DATA" and self.data_wait is wait:
+                self.health = "Automatic resume waiting for full preflight: " + (
+                    str(exc) or type(exc).__name__
+                )
+
+    def _estimate_nav(self, snapshot, quotes):
+        try:
+            return self.nav_tracker.estimate(snapshot, quotes, self.manifest.contract_map)
+        except ValueError as exc:
+            if str(exc).startswith(("NAV attribution waiting", "Fill quote missing")):
+                raise DataUnavailable(str(exc)) from None
+            raise
 
     async def reconcile(self):
         async with self.reconcile_lock:
@@ -298,7 +388,10 @@ class TradingService:
                         await self.reconcile()
                         if self.setup_armed:
                             self.mode = "WAITING_SETUP"
-                        self.health = "Connected; paper execution remains disabled until explicitly enabled"
+                        if self.mode != "WAITING_DATA":
+                            self.health = (
+                                "Connected; paper execution remains disabled until explicitly enabled"
+                            )
                     else:
                         await asyncio.sleep(1)
                         continue
@@ -312,6 +405,12 @@ class TradingService:
                 if time.monotonic() - self.last_reconcile >= self.manifest.policy.reconcile_seconds:
                     await self.reconcile()
                 self.last_snapshot = self.broker.snapshot()
+                if self.manifest.next_close(self.now()) is None:
+                    if self.mode in ("PAPER", "SETUP", "WAITING_DATA"):
+                        self._hard_stop("Contest ended; filled holdings retained")
+                        await self.execution.pause()
+                    await asyncio.sleep(self.manifest.policy.risk_seconds)
+                    continue
                 baseline = self.ledger.closes().get(self.manifest.day_zero)
                 if baseline is not None:
                     self.gate.engine.baseline_nav = self.optimizer.baseline_nav = float(baseline)
@@ -330,18 +429,20 @@ class TradingService:
                 self.recorder.append(self.last_quotes, self.manifest.contract_map, self.now())
                 missing = set(self.last_snapshot.quantities()) - self.last_quotes.keys()
                 if missing:
-                    raise ValueError(f"Waiting for supported live quotes on all holdings: {sorted(missing)}")
+                    if not missing.issubset(self.manifest.contract_map):
+                        raise ValueError(f"Unsupported actual broker positions: {sorted(missing)}")
+                    raise DataUnavailable(f"Waiting for quotes on held conIds {sorted(missing)}")
                 mandate_errors = self.gate.registry.check(self.last_snapshot.quantities())
                 if mandate_errors:
                     self.health = "; ".join(mandate_errors)
                     self.ready = False
                     if self.mode == "PAPER":
+                        self._hard_stop("Mandatory holdings mismatch: " + "; ".join(mandate_errors))
                         await self.execution.pause()
-                        self.mode = "PAUSED"
                     if self.mode != "SETUP":
                         self.alert("error", self.health)
                 if self.last_quotes:
-                    ids = screen_options(self.manifest, self.last_quotes, self.last_snapshot.quantities())
+                    ids = screen_snapshot(self.manifest, self.last_quotes, self.last_snapshot)
                     scenario_at = self.now()
                     scenario_snapshot_id = self.last_snapshot.version
                     scenario_revision = self.broker_event_revision
@@ -361,21 +462,30 @@ class TradingService:
                     self.ready = (
                         not mandate_errors and self.last_risk.passed and not self.execution.unresolved()
                     )
+                    if self.mode in ("PAPER", "SETUP") and data_only(self.last_risk.reasons):
+                        await self._wait_for_data("; ".join(self.last_risk.reasons))
                     if self.mode in ("PAPER", "SETUP") and self.last_snapshot.orders:
+                        working_snapshot = self.broker.snapshot()
                         projected_check = self.gate.validate(
-                            self.last_snapshot,
-                            self.last_quotes,
+                            working_snapshot,
+                            self.broker.quotes(),
                             self.last_scenarios,
-                            self.last_snapshot.projected(),
+                            working_snapshot.projected(),
                             self.now(),
                             corrective=not self.last_risk.passed,
                             day_zero=self.mode == "SETUP",
                         )
                         if not projected_check.passed:
-                            await self.execution.pause()
-                            self.mode = "PAUSED"
-                            self.health = "Working-order risk blocked: " + "; ".join(projected_check.reasons)
-                            self.alert("error", self.health)
+                            message = "Working-order check: " + "; ".join(projected_check.reasons)
+                            if data_only(projected_check.reasons):
+                                await self._wait_for_data(message)
+                            else:
+                                self._hard_stop(message)
+                                await self.execution.pause()
+                                self.alert("error", message)
+                    if self.mode == "WAITING_DATA":
+                        self.ready = False
+                    await self._resume_after_data_wait()
                     if self.mode in ("SHADOW", "PAPER"):
                         if self.optimization_due():
                             await self.optimize()
@@ -407,21 +517,23 @@ class TradingService:
                 if self.mode == "PAPER" and self.pending_target:
                     await self._execute_pending()
                 self.execution.current_scenarios = self.last_scenarios
-                await self.execution.manage(self.last_quotes, self.now())
+                # An optimizer/preflight may take seconds. Never manage a live
+                # order using the quote dictionary captured before that work.
+                await self.execution.manage(self.broker.quotes(), self.now())
                 if self.execution.paused and self.mode in ("PAPER", "SETUP"):
-                    self.mode = "PAUSED"
+                    self._hard_stop("Execution stopped; broker order state requires reconciliation")
                 if self.mode == "PAUSED" and self.execution.pause_requested:
                     self.health = (
-                        "Paused — all cancellations confirmed"
+                        (self.pause_reason or "Trading paused") + "; all cancellations confirmed"
                         if self.execution.pause_complete()
-                        else "Pause requested — awaiting broker confirmation"
+                        else (self.pause_reason or "Trading paused") + "; awaiting cancellation confirmation"
                     )
                 if (self.setup_armed or self.mode == "SETUP") and self.now() >= self.manifest.session_close(
                     self.manifest.purchase_session
                 ) - timedelta(minutes=self.manifest.execution.setup_cutoff_minutes):
                     self.setup_armed = self.auto_hedge_after_setup = False
+                    self._hard_stop("Scheduled mandatory purchase window ended")
                     await self.execution.pause()
-                    self.mode = "PAUSED"
                     self.alert(
                         "error",
                         "Scheduled mandatory purchase window ended; inspect holdings and organizer rules",
@@ -432,9 +544,8 @@ class TradingService:
                 if self.now() >= self.manifest.session_close(
                     self.manifest.scoring_sessions[-1]
                 ) and self.mode in ("PAPER", "SETUP"):
+                    self._hard_stop("Contest ended; filled holdings retained")
                     await self.execution.pause()
-                    self.mode = "PAUSED"
-                    self.health = "Contest ended; filled holdings retained"
                 if day:
                     previous = self.ledger.previous_close(day)
                     if previous is None and day != self.manifest.day_zero:
@@ -444,13 +555,22 @@ class TradingService:
                 await asyncio.sleep(self.manifest.policy.risk_seconds)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                self.health = str(exc)
+            except (DataUnavailable, TimeoutError, ConnectionError) as exc:
+                message = str(exc) or type(exc).__name__
                 self.ready = False
-                self.pending_target = None
-                if self.mode in ("PAPER", "SETUP"):
+                self.pending_target = self.pending_recovery = None
+                await self._wait_for_data(message)
+                if self.mode != "WAITING_DATA":
+                    self.health = "Waiting for broker/data: " + message
+                next_connection = time.monotonic() + 15
+                await asyncio.sleep(self.manifest.policy.risk_seconds)
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                if self.mode in ("PAPER", "SETUP", "WAITING_DATA"):
+                    self._hard_stop(message)
                     await self.execution.pause()
-                    self.mode = "PAUSED"
+                else:
+                    self.health, self.ready = message, False
                 try:
                     self.alert("error", self.health)
                 except Exception:
@@ -492,6 +612,7 @@ class TradingService:
             self.health = "Scoring revision pending; interest-offset optimization disabled"
             return
         async with self.decision_lock:
+            decision_epoch = self.control_epoch
             snap, quotes, scenarios, now = (
                 self.last_snapshot,
                 dict(self.last_quotes),
@@ -513,7 +634,8 @@ class TradingService:
                 self.force_optimize
                 or time.monotonic() - self.last_optimization["OPT"] >= self.manifest.policy.option_seconds
             )
-            estimate = self.nav_tracker.estimate(snap, quotes, self.manifest.contract_map)
+            quote_coverage(quotes, scenarios.ids)
+            estimate = self._estimate_nav(snap, quotes)
             target = await asyncio.to_thread(
                 self.optimizer.solve,
                 snap,
@@ -539,7 +661,7 @@ class TradingService:
                     return
                 snap, quotes, now = refreshed, dict(self.broker.quotes()), self.now()
                 previous = self.closing_target(snap, now)
-                ids = screen_options(self.manifest, quotes, snap.quantities())
+                ids = screen_snapshot(self.manifest, quotes, snap)
                 scenario_revision = self.broker_event_revision
                 scenarios = await asyncio.to_thread(self.scenarios.build, snap, quotes, now, ids)
                 self.last_snapshot, self.last_quotes, self.last_scenarios = snap, quotes, scenarios
@@ -557,7 +679,12 @@ class TradingService:
                 )
             # Broker inventory/order changes during optimization invalidate its decision.
             newest = self.broker.snapshot()
-            if newest.quantities() != snap.quantities() or newest.orders != snap.orders:
+            if (
+                newest.quantities() != snap.quantities()
+                or newest.orders != snap.orders
+                or decision_epoch != self.control_epoch
+            ):
+                self.last_target = None
                 self.force_optimize = True
                 return
             ordinary_floor = max(
@@ -683,11 +810,12 @@ class TradingService:
                     else None
                 )
                 self.active_plan_started = False
-            self.health = (
-                "Monitoring: proposal eligible"
-                if record["trade_eligible"]
-                else "Monitoring: " + "; ".join(record["blocking_reasons"] or ["No qualifying trade"])
-            )
+            if self.mode in ("SHADOW", "PAPER"):
+                self.health = (
+                    "Monitoring: proposal eligible"
+                    if record["trade_eligible"]
+                    else "Monitoring: " + "; ".join(record["blocking_reasons"] or ["No qualifying trade"])
+                )
 
     async def _execute_pending(self):
         target = self.pending_target
@@ -750,7 +878,12 @@ class TradingService:
         if previous is None:
             self.pending_target = None
             return
-        estimate = self.nav_tracker.estimate(snapshot, quotes, self.manifest.contract_map)
+        if not set(scenario_for_plan.ids).issubset(quotes):
+            self.pending_target = self.pending_recovery = None
+            self.active_plan_started, self.force_optimize = False, True
+            self.health = "Quote coverage changed during execution planning; refreshing the hedge proposal"
+            return
+        estimate = self._estimate_nav(snapshot, quotes)
         target = self.optimizer.evaluate_target(
             snapshot, quotes, scenario_for_plan, target, previous, estimate
         )
@@ -884,14 +1017,32 @@ class TradingService:
         except Exception as exc:
             self.alert("warning", f"AI supervisor unavailable; deterministic strategy continues: {exc}")
 
-    async def control(self, action, profile=None):
+    async def control(self, action, profile=None, *, _automatic=False):
+        if action == "profile" and (
+            profile not in PROFILES or (not self.demo and profile not in self.supervisor.allowed_profiles)
+        ):
+            raise ValueError("Profile not validated for this contest")
+        if not _automatic and action in ("pause", "shadow", "profile", "paper", "setup", "arm_setup"):
+            self.control_epoch += 1
+            self.data_wait = None
+            if action in ("pause", "shadow", "profile"):
+                # Disarm immediately, including while an automatic preflight is
+                # awaiting the broker. Its epoch check prevents late activation.
+                self.execution.paused = True
+                self.broker.readonly = True
         async with self.control_lock:
+            activation_epoch = self.control_epoch
+            if _automatic and (
+                self.mode != "WAITING_DATA"
+                or self.data_wait is None
+                or self.data_wait["epoch"] != activation_epoch
+            ):
+                raise ValueError("Automatic activation superseded by an operator action")
             if action == "pause":
                 self.setup_target_quantities = None
                 self.setup_armed = self.auto_hedge_after_setup = False
                 self.store.record("setup_schedule", self.manifest.account, {"status": "CANCELLED"})
-                self.mode = "PAUSED"
-                self.pending_target = self.pending_recovery = None
+                self._hard_stop("Operator requested pause")
                 self.execution.recovery_checks = None
                 await self.execution.pause()
             elif action == "shadow":
@@ -904,6 +1055,8 @@ class TradingService:
                     raise ValueError("Wait for pending cancellations/reconciliation before shadow mode")
                 self.broker.readonly = True
                 self.mode, self.force_optimize = "SHADOW", True
+                self.pause_reason = None
+                self.health = "Shadow monitoring enabled; no paper submissions"
             elif action in ("paper", "setup", "arm_setup"):
                 if self.manifest.scoring_rule == "pending_interest_adjustment":
                     raise ValueError("Instructor's revised scoring formula required before activation")
@@ -914,7 +1067,11 @@ class TradingService:
                         "Automatic IBKR paper trading requires PostgreSQL; SQLite is for demo/research"
                     )
                 await self.reconcile()
-                if self.execution.unresolved() or self.store.intents(self.manifest.account, True):
+                if (
+                    self.execution.unresolved()
+                    or self.store.intents(self.manifest.account, True)
+                    or self.broker.snapshot().orders
+                ):
                     raise ValueError("Resolve working or uncertain orders before enabling execution")
                 if action == "arm_setup":
                     deadline = self.manifest.session_close(self.manifest.purchase_session) - timedelta(
@@ -942,6 +1099,20 @@ class TradingService:
                     return self.state()
                 if not self.last_scenarios or not self.last_quotes:
                     raise ValueError("Waiting for quotes/scenario/risk validation")
+                # Reconciliation may have changed holdings or resolved a fill.
+                # Activation always prices the CURRENT complete book, not an
+                # older optimizer frame. Work stays off the broker event loop.
+                self.last_snapshot, self.last_quotes = self.broker.snapshot(), self.broker.quotes()
+                quote_coverage(self.last_quotes, self.last_snapshot.quantities())
+                scenario_at = self.now()
+                scenario_revision = self.broker_event_revision
+                scenario_snapshot_id = self.last_snapshot.version
+                ids = screen_snapshot(self.manifest, self.last_quotes, self.last_snapshot)
+                self.last_scenarios = await asyncio.to_thread(
+                    self.scenarios.build, self.last_snapshot, self.last_quotes, scenario_at, ids
+                )
+                self.last_scenario_at, self.last_scenario_revision = scenario_at, scenario_revision
+                self.last_scenario_snapshot_id = scenario_snapshot_id
                 if action == "paper":
                     # Score prerequisites precede risk optimization: otherwise a
                     # missing close makes optimize() return without a target and
@@ -959,6 +1130,10 @@ class TradingService:
                         self.broker.snapshot().quantities(),
                         self.now(),
                     )
+                    if not result.passed and data_only(result.reasons):
+                        raise DataUnavailable(
+                            "Activation awaiting verified data: " + "; ".join(result.reasons)
+                        )
                     if not result.passed:
                         # PAUSED has no proposal loop. Build a fresh, auditable
                         # target here instead of requiring a pre-existing target
@@ -1058,6 +1233,27 @@ class TradingService:
                             "explanation": "Complete mandatory + protective option + residual stock plan; guaranteed paired acquisitions only",
                         },
                     )
+                if activation_epoch != self.control_epoch:
+                    raise ValueError(
+                        "Activation superseded by an operator action; execution remains disabled"
+                    )
+                if _automatic:
+                    self.store.record(
+                        "continuity",
+                        self.manifest.account,
+                        {
+                            "status": "RESUMED",
+                            "mode": "PAPER" if action == "paper" else "SETUP",
+                            "config_hash": self.manifest.config_hash,
+                            "at": self.now().isoformat(),
+                            "snapshot_id": self.broker.snapshot().version,
+                        },
+                    )
+                self.data_wait = None
+                self.pause_reason = None
+                self.ready = action == "paper" and result.passed
+                if action == "paper":
+                    self.last_risk = result
                 self.broker.readonly = False
                 self.execution.paused = self.execution.pause_requested = False
                 self.setup_armed = False
@@ -1066,6 +1262,12 @@ class TradingService:
                     self.pending_target = self.last_target
                     self.active_plan_started = False
                     self.health = "Paper enabled: executing independently validated corrective hedge"
+                else:
+                    self.health = (
+                        "Paper trading enabled; fresh activation checks passed"
+                        if action == "paper"
+                        else "Protected setup enabled; fresh preflight passed"
+                    )
             elif action == "reconcile":
                 await self.reconcile()
                 if not self.demo and self.market_data_errors:
@@ -1078,6 +1280,8 @@ class TradingService:
                     raise ValueError("Profile not validated for this contest")
                 await self.execution.pause()
                 self.mode = "SHADOW"
+                self.pause_reason = None
+                self.health = "Profile changed; shadow monitoring enabled"
                 self.pending_target = None
                 self.active_plan_started = False
                 self.broker.readonly = True
@@ -1253,6 +1457,12 @@ class TradingService:
                 "profile": self.profile,
                 "profiles": list(PROFILES if self.demo else self.supervisor.allowed_profiles),
                 "pause_pending": self.execution.pause_requested and not self.execution.pause_complete(),
+                "continuity": {
+                    "automatic_resume_pending": self.mode == "WAITING_DATA" and self.data_wait is not None,
+                    "wait": self.data_wait,
+                    "pause_reason": self.pause_reason,
+                    "retry_seconds": 15,
+                },
                 "contract_labels": {i: c.label for i, c in self.manifest.contract_map.items()},
                 "quote_count": len(self.last_quotes),
                 "market_data_provider": "moomoo (data only)"

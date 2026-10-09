@@ -1,3 +1,12 @@
+def screen_snapshot(manifest, quotes, snapshot):
+    """Retain filled inventory AND working legs, including orders closing to zero."""
+    retained = snapshot.quantities()
+    for order in snapshot.orders:
+        if order.signed_remaining:
+            retained.setdefault(order.con_id, order.signed_remaining)
+    return screen_options(manifest, quotes, retained)
+
+
 def screen_options(manifest, quotes, actual):
     """Screen by moneyness/expiry deterministically, preserving held hedges."""
     chosen = {i for i in actual if actual[i]} | set(manifest.mandatory)
