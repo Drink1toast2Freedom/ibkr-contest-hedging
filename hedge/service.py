@@ -15,6 +15,7 @@ from .continuity import DataUnavailable, data_only, quote_coverage
 from .data import QuoteRecorder
 from .demo import demo_quotes
 from .execution import ExecutionManager
+from .execution_quality import execution_quality
 from .models import digest, utcnow
 from .moomoo_data import MoomooData
 from .optimizer import HedgeOptimizer, execution_cost
@@ -50,6 +51,8 @@ class TradingService:
         self.gate = RiskGate(manifest, demo)
         self.execution = ExecutionManager(manifest, store, self.broker, self.gate)
         self.scenarios = ScenarioEngine(manifest, history)
+        self.execution.scenario_builder = self.scenarios.build
+        self.execution.clock = lambda: self.now()
         self.optimizer = HedgeOptimizer(manifest)
         self.ledger = ScoreLedger(store, manifest)
         self.recorder = QuoteRecorder()
@@ -773,6 +776,7 @@ class TradingService:
             ).passed
             record = {
                 **target.model_dump(mode="json"),
+                "reference_midpoints": {str(i): q.mid for i, q in quotes.items()},
                 "risk_passed": gate.passed,
                 "risk_reasons": gate.reasons,
                 "improvement": improvement,
@@ -1225,6 +1229,7 @@ class TradingService:
                         snapshot.account,
                         {
                             **self.setup_target.model_dump(mode="json"),
+                            "reference_midpoints": {str(i): q.mid for i, q in self.last_quotes.items()},
                             "profile": "PROTECTED_DAY0",
                             "pairs": self.setup_pairs,
                             "at": self.now().isoformat(),
@@ -1460,6 +1465,9 @@ class TradingService:
                 "positions": positions,
                 "orders": self.store.intents(self.manifest.account),
                 "fills": self.store.fills(self.manifest.account),
+                "execution_quality": execution_quality(
+                    self.store, self.manifest.account, self.manifest.contract_map
+                ),
                 "package_executions": self.store.records("package_execution", self.manifest.account, 100),
                 "package_commissions": self.store.records("package_commission", self.manifest.account, 100),
                 "transitions": self.store.records("order_transition", self.manifest.account, 100),

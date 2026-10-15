@@ -62,3 +62,56 @@ to market orders; cancellation and reconciliation still precede a new slice.
 These rules improve execution responsiveness and factor coverage. They do not
 establish optimal real fill quality or better contest performance. Evaluate
 realistic quote replay and IBKR paper fills before changing account settings.
+
+## Consistent execution scenarios
+
+Each scenario set records its valuation time and the spot/IV inputs for every
+included contract. Immediately before a single-order or protected-package
+submission, and before managing an acknowledged order, execution checks these
+inputs and a maximum age of `policy.risk_seconds`. Changed or older ordinary
+scenarios are rebuilt off the event loop using the service's existing history
+configuration and the same instrument IDs. Inputs are checked again after the
+build. A second market move rejects submission or cancels the working order so
+the service can reconcile and replan; it does not loop indefinitely trying to
+catch a moving quote. Pause, holdings, working orders, spread, cost and partial
+fill path checks still apply after rebuilding. Pretransmission records retain
+the actual scenario ID and timestamp used for the final check.
+
+Recovery scenarios contain additional forecast adjustments. A stale recovery
+scenario requires a new recovery plan; replacing it with an ordinary scenario
+would discard that forecast. An unknown scenario provenance likewise triggers
+refresh rather than being treated as current. Fresh market data checks remain
+independent: unchanged spot/IV does not make an old quote eligible to trade.
+
+## Execution quality
+
+The Trades page and `/api/export/execution_quality` expose one row per durable
+order intent (one per leg for a protected package), reconstructed from persisted
+records rather than in-memory counters:
+
+- Filled/requested quantity and fill ratio use effective execution reports;
+  submission or a Filled status callback alone does not invent a fill. A ratio
+  is unavailable until a durable submission attempt exists.
+- First, last and quantity-weighted fill waits start at the durable SUBMITTING
+  transition. They include acknowledgement/network time and are not exchange
+  queue-latency estimates. Invalid negative intervals are unavailable.
+- Decision slippage uses the midpoint captured with the decision inputs; arrival
+  slippage uses the initial slice/package-leg reference midpoint. Positive dollar
+  slippage is adverse for both buys and sells and includes the contract multiplier.
+  Partial fills measure only executed quantities, not opportunity cost of unfilled
+  orders. Old decisions lacking a stored midpoint remain unavailable.
+- Known USD commissions are shown separately. Total decision cost is only given
+  when the decision reference and all USD commissions for effective fills are
+  available. Non-USD and missing fees are not silently treated as zero. Later fee
+  reports and execution corrections update the calculation without counting the
+  replaced execution twice. Net combo commission reports are not charged again
+  on top of individual leg fees.
+- Amendments and cancellations count recorded local attempts, not broker-confirmed
+  successes. Cancel attempts are linked to intent IDs to avoid reused broker-order
+  IDs mixing histories. Package attempts appear on both leg rows; do not sum those
+  shared counts across legs. Unlinked/manual executions are not attributed to a
+  strategy intent.
+
+The report covers the account's stored intents and survives process restarts.
+Synthetic fills remain synthetic evidence; this report does not establish live
+fill quality or demonstrate that a routing policy improves contest scores.

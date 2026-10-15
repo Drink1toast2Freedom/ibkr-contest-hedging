@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -24,6 +24,16 @@ class ScenarioSet:
     betas: dict[str, float] = field(default_factory=dict)
     rhos: dict[int, float] = field(default_factory=dict)
     beta_source: str = "Unavailable: no validated benchmark history"
+    built_at: datetime | None = None
+    valuation_inputs: dict[int, tuple[float, float | None]] = field(default_factory=dict)
+
+    def is_current(self, quotes, now, max_age):
+        return (
+            self.built_at is not None
+            and 0 <= (now - self.built_at).total_seconds() <= max_age
+            and set(self.ids).issubset(quotes)
+            and self.valuation_inputs == {i: (quotes[i].spot, quotes[i].iv) for i in self.ids}
+        )
 
     def __post_init__(self):
         if self.changes.shape[1] != len(self.ids) or self.changes.shape[0] != len(self.weights):
@@ -175,7 +185,19 @@ class ScenarioEngine:
             }
         )
         return ScenarioSet(
-            ids, changes, weights, stress, next_changes, days, source, identifier, betas, rhos, beta_source
+            ids,
+            changes,
+            weights,
+            stress,
+            next_changes,
+            days,
+            source,
+            identifier,
+            betas,
+            rhos,
+            beta_source,
+            now,
+            {i: (quotes[i].spot, quotes[i].iv) for i in ids},
         )
 
     def market_betas(self, now, symbols):
