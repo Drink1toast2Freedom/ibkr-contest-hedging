@@ -260,6 +260,8 @@ async def test_monitor_uses_current_quotes_after_slow_optimization(operational, 
     captured = []
 
     async def delayed_optimizer():
+        # Working orders must be managed before a potentially slow solve.
+        assert captured and captured[0][1] == clock[0]
         clock[0] += timedelta(seconds=8)
         fresh = {
             i: q.model_copy(update={"observed_at": clock[0], "greek_at": clock[0]})
@@ -269,14 +271,15 @@ async def test_monitor_uses_current_quotes_after_slow_optimization(operational, 
 
     async def management(quotes, now):
         captured.append((quotes, now))
-        checked.set()
+        if len(captured) >= 2:
+            checked.set()
 
     monkeypatch.setattr(s, "optimize", delayed_optimizer)
     monkeypatch.setattr(s.execution, "manage", management)
     task = asyncio.create_task(s._monitor_loop())
     try:
         await asyncio.wait_for(checked.wait(), 5)
-        quotes, at = captured[0]
+        quotes, at = captured[1]
         assert all(q.observed_at == at for q in quotes.values())
         assert s.last_quotes[10].observed_at < at - timedelta(seconds=s.manifest.risk.stock_quote_age)
         assert s.mode == "PAPER" and not s.execution.paused

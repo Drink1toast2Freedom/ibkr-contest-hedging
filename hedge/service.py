@@ -327,7 +327,12 @@ class TradingService:
             return
         if self.last_risk and any(
             reason.startswith(
-                ("Non-live quote:", "Stale/future quote:", "Missing/stale option Greeks:", "Future option Greeks:")
+                (
+                    "Non-live quote:",
+                    "Stale/future quote:",
+                    "Missing/stale option Greeks:",
+                    "Future option Greeks:",
+                )
             )
             for reason in self.last_risk.reasons
         ):
@@ -488,6 +493,10 @@ class TradingService:
                     if self.mode == "WAITING_DATA":
                         self.ready = False
                     await self._resume_after_data_wait()
+                    # Service existing orders before a solver can consume its
+                    # time budget. Use the just-rebuilt risk scenarios.
+                    self.execution.current_scenarios = self.last_scenarios
+                    await self.execution.manage(self.broker.quotes(), self.now())
                     if self.mode in ("SHADOW", "PAPER"):
                         if self.optimization_due():
                             await self.optimize()
@@ -1383,6 +1392,11 @@ class TradingService:
                 "contest": self.manifest.name,
                 "account": self.manifest.account,
                 "demo": self.demo,
+                "risk_factors": {
+                    "beta_benchmark": self.manifest.beta_benchmark,
+                    "beta_source": self.last_scenarios.beta_source if self.last_scenarios else "Unavailable",
+                    "rho_source": "American-option model; dollars per 1 percentage-point rate change",
+                },
                 "rehearsal": self.rehearsal,
                 "day_zero": str(self.manifest.day_zero),
                 "purchase_session": str(self.manifest.purchase_session),

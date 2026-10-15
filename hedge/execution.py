@@ -708,6 +708,8 @@ class ExecutionManager:
                 else p.stock_wait_seconds
             )
             try:
+                if self.paused or self.pause_requested or self.broker.readonly:
+                    raise ValueError("Execution paused; cancel working order before repricing")
                 if sent is None or (now - sent).total_seconds() >= lifetime:
                     raise ValueError("Patient order expired; reconcile and replan")
                 package = (
@@ -732,7 +734,15 @@ class ExecutionManager:
                     ):
                         raise ValueError("Order quote stale or spread too wide")
                 elapsed = (now - sent).total_seconds()
-                if elapsed < wait or row.get("order_type") == "MKT":
+                if not package:
+                    snapshot = self.broker.snapshot()
+                    current = self.gate.engine.evaluate(
+                        snapshot, quotes, self.current_scenarios, snapshot.quantities()
+                    )
+                    urgency = urgency_for(self.manifest, c, now, not current.passed)
+                if row.get("order_type") == "MKT" or (
+                    elapsed < wait and (package or urgency not in ("CORRECTIVE", "DEADLINE"))
+                ):
                     continue
                 if package:
                     a, b = (quotes[i] for i in ids)
@@ -770,7 +780,6 @@ class ExecutionManager:
                         raise ValueError("Order has no recoverable price budget")
                     q = quotes[row["con_id"]]
                     signed = row["signed_quantity"]
-                    snapshot = self.broker.snapshot()
                     remaining = next(
                         (
                             o.signed_remaining
@@ -785,20 +794,22 @@ class ExecutionManager:
                         **snapshot.quantities(),
                         row["con_id"]: snapshot.quantities().get(row["con_id"], 0) + remaining,
                     }
-                    current = self.gate.engine.evaluate(
-                        snapshot, quotes, self.current_scenarios, snapshot.quantities()
-                    )
-                    urgency = urgency_for(self.manifest, c, now, not current.passed)
                     fraction = (
                         0.5 if urgency in ("CORRECTIVE", "DEADLINE") else min(0.5, 0.25 * int(elapsed / wait))
                     )
-                    value = q.mid + (1 if signed > 0 else -1) * fraction * (q.ask - q.bid)
+                    value = (
+                        (q.ask if signed > 0 else q.bid)
+                        if urgency in ("CORRECTIVE", "DEADLINE")
+                        else q.mid + (1 if signed > 0 else -1) * fraction * (q.ask - q.bid)
+                    )
                     tick = (
                         self.broker.price_tick(row["con_id"], value)
                         if hasattr(self.broker, "price_tick")
                         else 0.01
                     )
-                    price = rounded_price(value, tick, signed)
+                    price = rounded_price(
+                        value, tick, -signed if urgency in ("CORRECTIVE", "DEADLINE") else signed
+                    )
                     if (float(price) - plan["price_cap"]) * (1 if signed > 0 else -1) > 1e-9:
                         raise ValueError("Order exceeds original modeled price budget")
                     costs = execution_cost(self.manifest, quotes, [row["con_id"]], [remaining])
