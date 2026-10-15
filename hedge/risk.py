@@ -123,6 +123,8 @@ class RiskGate:
             reasons.append("Stale/future portfolio snapshot")
         if now - snapshot.account_at > timedelta(seconds=self.manifest.risk.account_age):
             reasons.append("Stale account value")
+        if snapshot.account_at > now + timedelta(seconds=1):
+            reasons.append("Future account value")
         actual = snapshot.quantities()
         if not day_zero:
             reasons.extend(self.registry.check(actual))
@@ -163,6 +165,8 @@ class RiskGate:
                 or (now - q.greek_at).total_seconds() > self.manifest.risk.greek_age
             ):
                 reasons.append(f"Missing/stale option Greeks: {i}")
+            if c.kind == "OPT" and q.greek_at is not None and q.greek_at > now + timedelta(seconds=1):
+                reasons.append(f"Future option Greeks: {i}")
             if quantities.get(i, 0) != actual.get(i, 0):
                 if c.kind == "STK" and quantities.get(i, 0) < min(0, actual.get(i, 0)):
                     if q.shortable_shares is None or abs(quantities[i]) > q.shortable_shares:

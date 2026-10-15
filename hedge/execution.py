@@ -70,6 +70,7 @@ class ExecutionManager:
         """Read-only execution-path check, shared by activation and submission."""
         actual = snapshot.quantities()
         candidates = []
+        current_risk = None
         for i in sorted(set(target.quantities) | set(actual)):
             difference = target.quantities.get(i, 0) - actual.get(i, 0)
             if not difference:
@@ -90,7 +91,8 @@ class ExecutionManager:
             partial = dict(actual)
             partial[i] = partial.get(i, 0) + signed
             costs = execution_cost(self.manifest, quotes, [i], [signed])
-            current_risk = self.gate.engine.evaluate(snapshot, quotes, scenarios, actual)
+            if current_risk is None:
+                current_risk = self.gate.engine.evaluate(snapshot, quotes, scenarios, actual)
             if setup and i in self.manifest.mandatory:
                 continue  # Mandatory acquisitions can only use protected packages.
             if spread_error(self.manifest, c, q):
@@ -319,6 +321,10 @@ class ExecutionManager:
                 )
                 if not gate.passed:
                     raise ValueError("; ".join(gate.reasons))
+                if self.recovery_checks:
+                    extra = self.recovery_checks(fresh, qs, scenarios, partial, 2 * costs)
+                    if extra:
+                        raise ValueError("; ".join(extra))
                 if (
                     current.passed
                     and not setup
@@ -806,6 +812,12 @@ class ExecutionManager:
                         corrective=not current.passed,
                     ).passed:
                         raise ValueError("Reprice fails fresh risk check")
+                    if self.recovery_checks:
+                        extra = self.recovery_checks(
+                            snapshot, quotes, self.current_scenarios, quantities, 2 * costs
+                        )
+                        if extra:
+                            raise ValueError("; ".join(extra))
                     if current.passed and not self.economic_check(
                         snapshot, quotes, self.current_scenarios, quantities, now
                     ):

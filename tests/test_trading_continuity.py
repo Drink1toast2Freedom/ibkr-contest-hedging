@@ -230,6 +230,7 @@ async def test_pause_during_credit_preview_prevents_transmission(operational, mo
     "reasons,expected",
     [
         (("Non-live quote: 10", "Stale account value"), True),
+        (("Future account value", "Future option Greeks: 101"), True),
         (("Non-live quote: 10", "Stress loss exceeds 3% budget"), False),
         (("Mandatory conId 101: expected 25, actual 24",), False),
         ((), False),

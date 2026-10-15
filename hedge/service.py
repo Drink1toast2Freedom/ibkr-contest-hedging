@@ -326,7 +326,9 @@ class TradingService:
         if time.monotonic() < self.resume_next_at:
             return
         if self.last_risk and any(
-            reason.startswith(("Non-live quote:", "Stale/future quote:", "Missing/stale option Greeks:"))
+            reason.startswith(
+                ("Non-live quote:", "Stale/future quote:", "Missing/stale option Greeks:", "Future option Greeks:")
+            )
             for reason in self.last_risk.reasons
         ):
             return
